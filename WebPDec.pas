@@ -2,8 +2,8 @@ unit WebPDec;
 
 ////////////////////////////////////////////////////////////////////////////////
 //                                                                            //
-// Description:	WEBP port (decoder only)                                      //
-// Version:	0.4                                                           //
+// Description:	WEBP port                                                     //
+// Version:	0.5                                                           //
 // Date:	30-MAY-2026                                                   //
 // License:     MIT                                                           //
 // Target:	Win64, Free Pascal, Delphi                                    //
@@ -32,11 +32,10 @@ function WebPDecodeRGB(Data: PByte; DataSize: NativeUInt;
   out Width, Height: Integer): PByte;
 function WebPDecodeBGR(Data: PByte; DataSize: NativeUInt;
   out Width, Height: Integer): PByte;
+procedure WebPFree(ptr: Pointer);
 
 implementation
 {$POINTERMATH ON}
-
-uses SysUtils;
 
 // ============================================================
 // TYPES
@@ -4077,6 +4076,11 @@ function WebPDecodeBGR(Data: PByte; DataSize: NativeUInt;
   out Width, Height: Integer): PByte;
 begin
   Result := InternalDecode(Data, DataSize, csmBGR, Width, Height);
+end;
+
+procedure WebPFree(ptr: Pointer);
+begin
+  FreeMemory(ptr);
 end;
 
 end.
