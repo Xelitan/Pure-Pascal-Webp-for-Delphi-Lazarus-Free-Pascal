@@ -5,11 +5,11 @@ unit WebpImageX;
 ////////////////////////////////////////////////////////////////////////////////
 //                                                                            //
 // Description:	Reader for WEBP images                                        //
-// Version:	0.3                                                           //
-// Date:	28-MAY-2026                                                   //
+// Version:	0.4                                                           //
+// Date:	30-MAY-2026                                                   //
 // License:     MIT                                                           //
 // Target:	Win64, Free Pascal, Delphi                                    //
-// Copyright:	(c) 2026 Xelitan.com.                                         //
+// Copyright:	(c) 2025 Xelitan.com.                                         //
 //		All rights reserved.                                          //
 //                                                                            //
 ////////////////////////////////////////////////////////////////////////////////
@@ -130,7 +130,7 @@ end;
 
 procedure TWebpImage.SaveToStream(Stream: TStream);
 begin
-  raise Exception.Create('Saving not supported');
+  //raise exception here
 end;
 
 constructor TWebpImage.Create;
@@ -154,7 +154,7 @@ begin
 end;
 
 initialization
-  TPicture.RegisterFileFormat('Webp','Webp Image', TWebpImage);
+  TPicture.RegisterFileFormat('WebP','WebP Image', TWebPImage);
 
 finalization
   TPicture.UnregisterGraphicClass(TWebpImage);

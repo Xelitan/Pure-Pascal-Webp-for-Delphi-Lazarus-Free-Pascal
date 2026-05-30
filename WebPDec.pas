@@ -1,11 +1,10 @@
 unit WebPDec;
 
-
 ////////////////////////////////////////////////////////////////////////////////
 //                                                                            //
 // Description:	WEBP port (decoder only)                                      //
-// Version:	0.3                                                           //
-// Date:	28-MAY-2026                                                   //
+// Version:	0.4                                                           //
+// Date:	30-MAY-2026                                                   //
 // License:     MIT                                                           //
 // Target:	Win64, Free Pascal, Delphi                                    //
 // Copyright:	(c) 2026 Xelitan.com.                                         //
@@ -854,6 +853,15 @@ end;
 // DECODER DATA TYPES
 // ============================================================
 type
+  // Per-macroblock loop-filter info (mirrors libwebp VP8FInfo)
+  TVP8FInfo = record
+    FLimit:    Integer;   // filter limit (0 = no filtering)
+    FILevel:   Integer;   // interior limit
+    HevThresh: Integer;   // high edge variance threshold
+    FInner:    Boolean;   // filter inner edges
+  end;
+  PVP8FInfo = ^TVP8FInfo;
+
   TVP8Decoder = record
     // Main bitreader (partition 0)
     BR:          TVP8Rd;
@@ -910,6 +918,17 @@ type
     IntraL:       array[0..3] of Byte;  // left 4x4 mode per row
     // Final output buffer
     OutBuf:      PByte;
+
+    // --- In-loop filter ---
+    FilterType:  Integer;   // 0 = none, 1 = simple, 2 = complex
+    FStrength:   array[0..NUM_MB_SEGMENTS-1, 0..1] of TVP8FInfo;  // [segment][i4x4]
+    FInfo:       PVP8FInfo; // per-MB (MbW*MbH) filter info
+    // Full-frame reconstructed YUV planes (filled per MB, then filtered)
+    FYPlane:     PByte;
+    FUPlane:     PByte;
+    FVPlane:     PByte;
+    FYStride:    Integer;
+    FUVStride:   Integer;
   end;
 
 // ============================================================
@@ -1910,6 +1929,373 @@ begin
 end;
 
 // ============================================================
+// VP8 IN-LOOP FILTER  (port of dsp/dec.c + frame_dec.c)
+// ============================================================
+
+function FSclip1(v: Integer): Integer; inline;
+begin if v < -128 then Result := -128 else if v > 127 then Result := 127 else Result := v; end;
+function FSclip2(v: Integer): Integer; inline;
+begin if v < -16 then Result := -16 else if v > 15 then Result := 15 else Result := v; end;
+function FClip1(v: Integer): Integer; inline;
+begin if v < 0 then Result := 0 else if v > 255 then Result := 255 else Result := v; end;
+
+// 4 pixels in, 2 pixels out
+procedure FDoFilter2(p: PByte; step: Integer); inline;
+var p1, p0, q0, q1, a, a1, a2: Integer;
+begin
+  p1 := (p + (-2*step))^; p0 := (p + (-step))^; q0 := p^; q1 := (p + step)^;
+  a  := 3*(q0 - p0) + FSclip1(p1 - q1);
+  a1 := FSclip2(SarI(a + 4, 3));
+  a2 := FSclip2(SarI(a + 3, 3));
+  (p + (-step))^ := Byte(FClip1(p0 + a2));
+  p^             := Byte(FClip1(q0 - a1));
+end;
+
+// 4 pixels in, 4 pixels out
+procedure FDoFilter4(p: PByte; step: Integer); inline;
+var p1, p0, q0, q1, a, a1, a2, a3: Integer;
+begin
+  p1 := (p + (-2*step))^; p0 := (p + (-step))^; q0 := p^; q1 := (p + step)^;
+  a  := 3*(q0 - p0);
+  a1 := FSclip2(SarI(a + 4, 3));
+  a2 := FSclip2(SarI(a + 3, 3));
+  a3 := SarI(a1 + 1, 1);
+  (p + (-2*step))^ := Byte(FClip1(p1 + a3));
+  (p + (-step))^   := Byte(FClip1(p0 + a2));
+  p^               := Byte(FClip1(q0 - a1));
+  (p + step)^      := Byte(FClip1(q1 - a3));
+end;
+
+// 6 pixels in, 6 pixels out
+procedure FDoFilter6(p: PByte; step: Integer); inline;
+var p2, p1, p0, q0, q1, q2, a, a1, a2, a3: Integer;
+begin
+  p2 := (p + (-3*step))^; p1 := (p + (-2*step))^; p0 := (p + (-step))^;
+  q0 := p^; q1 := (p + step)^; q2 := (p + 2*step)^;
+  a  := FSclip1(3*(q0 - p0) + FSclip1(p1 - q1));
+  a1 := SarI(27*a + 63, 7);
+  a2 := SarI(18*a + 63, 7);
+  a3 := SarI(9*a  + 63, 7);
+  (p + (-3*step))^ := Byte(FClip1(p2 + a3));
+  (p + (-2*step))^ := Byte(FClip1(p1 + a2));
+  (p + (-step))^   := Byte(FClip1(p0 + a1));
+  p^               := Byte(FClip1(q0 - a1));
+  (p + step)^      := Byte(FClip1(q1 - a2));
+  (p + 2*step)^    := Byte(FClip1(q2 - a3));
+end;
+
+function FHev(p: PByte; step, thresh: Integer): Boolean; inline;
+var p1, p0, q0, q1: Integer;
+begin
+  p1 := (p + (-2*step))^; p0 := (p + (-step))^; q0 := p^; q1 := (p + step)^;
+  Result := (Abs(p1 - p0) > thresh) or (Abs(q1 - q0) > thresh);
+end;
+
+function FNeedsFilter(p: PByte; step, t: Integer): Boolean; inline;
+var p1, p0, q0, q1: Integer;
+begin
+  p1 := (p + (-2*step))^; p0 := (p + (-step))^; q0 := p^; q1 := (p + step)^;
+  Result := (4*Abs(p0 - q0) + Abs(p1 - q1)) <= t;
+end;
+
+function FNeedsFilter2(p: PByte; step, t, it: Integer): Boolean; inline;
+var p3, p2, p1, p0, q0, q1, q2, q3: Integer;
+begin
+  p3 := (p + (-4*step))^; p2 := (p + (-3*step))^; p1 := (p + (-2*step))^; p0 := (p + (-step))^;
+  q0 := p^; q1 := (p + step)^; q2 := (p + 2*step)^; q3 := (p + 3*step)^;
+  if (4*Abs(p0 - q0) + Abs(p1 - q1)) > t then begin Result := False; Exit; end;
+  Result := (Abs(p3-p2) <= it) and (Abs(p2-p1) <= it) and (Abs(p1-p0) <= it)
+        and (Abs(q3-q2) <= it) and (Abs(q2-q1) <= it) and (Abs(q1-q0) <= it);
+end;
+
+// --- Simple filter (luma only) ---
+procedure FSimpleVFilter16(p: PByte; stride, thresh: Integer);
+var i, t2: Integer;
+begin
+  t2 := 2*thresh + 1;
+  for i := 0 to 15 do
+    if FNeedsFilter(p + i, stride, t2) then FDoFilter2(p + i, stride);
+end;
+procedure FSimpleHFilter16(p: PByte; stride, thresh: Integer);
+var i, t2: Integer;
+begin
+  t2 := 2*thresh + 1;
+  for i := 0 to 15 do
+    if FNeedsFilter(p + i*stride, 1, t2) then FDoFilter2(p + i*stride, 1);
+end;
+procedure FSimpleVFilter16i(p: PByte; stride, thresh: Integer);
+var k: Integer;
+begin
+  for k := 3 downto 1 do begin p := p + 4*stride; FSimpleVFilter16(p, stride, thresh); end;
+end;
+procedure FSimpleHFilter16i(p: PByte; stride, thresh: Integer);
+var k: Integer;
+begin
+  for k := 3 downto 1 do begin p := p + 4; FSimpleHFilter16(p, stride, thresh); end;
+end;
+
+// --- Complex filter ---
+procedure FFilterLoop26(p: PByte; hstride, vstride, size, thresh, ithresh, hevt: Integer);
+var t2: Integer;
+begin
+  t2 := 2*thresh + 1;
+  while size > 0 do
+  begin
+    if FNeedsFilter2(p, hstride, t2, ithresh) then
+    begin
+      if FHev(p, hstride, hevt) then FDoFilter2(p, hstride)
+      else FDoFilter6(p, hstride);
+    end;
+    p := p + vstride;
+    Dec(size);
+  end;
+end;
+procedure FFilterLoop24(p: PByte; hstride, vstride, size, thresh, ithresh, hevt: Integer);
+var t2: Integer;
+begin
+  t2 := 2*thresh + 1;
+  while size > 0 do
+  begin
+    if FNeedsFilter2(p, hstride, t2, ithresh) then
+    begin
+      if FHev(p, hstride, hevt) then FDoFilter2(p, hstride)
+      else FDoFilter4(p, hstride);
+    end;
+    p := p + vstride;
+    Dec(size);
+  end;
+end;
+
+procedure FVFilter16(p: PByte; stride, thresh, ithresh, hevt: Integer);
+begin FFilterLoop26(p, stride, 1, 16, thresh, ithresh, hevt); end;
+procedure FHFilter16(p: PByte; stride, thresh, ithresh, hevt: Integer);
+begin FFilterLoop26(p, 1, stride, 16, thresh, ithresh, hevt); end;
+procedure FVFilter16i(p: PByte; stride, thresh, ithresh, hevt: Integer);
+var k: Integer;
+begin
+  for k := 3 downto 1 do begin p := p + 4*stride; FFilterLoop24(p, stride, 1, 16, thresh, ithresh, hevt); end;
+end;
+procedure FHFilter16i(p: PByte; stride, thresh, ithresh, hevt: Integer);
+var k: Integer;
+begin
+  for k := 3 downto 1 do begin p := p + 4; FFilterLoop24(p, 1, stride, 16, thresh, ithresh, hevt); end;
+end;
+procedure FVFilter8(u, v: PByte; stride, thresh, ithresh, hevt: Integer);
+begin
+  FFilterLoop26(u, stride, 1, 8, thresh, ithresh, hevt);
+  FFilterLoop26(v, stride, 1, 8, thresh, ithresh, hevt);
+end;
+procedure FHFilter8(u, v: PByte; stride, thresh, ithresh, hevt: Integer);
+begin
+  FFilterLoop26(u, 1, stride, 8, thresh, ithresh, hevt);
+  FFilterLoop26(v, 1, stride, 8, thresh, ithresh, hevt);
+end;
+procedure FVFilter8i(u, v: PByte; stride, thresh, ithresh, hevt: Integer);
+begin
+  FFilterLoop24(u + 4*stride, stride, 1, 8, thresh, ithresh, hevt);
+  FFilterLoop24(v + 4*stride, stride, 1, 8, thresh, ithresh, hevt);
+end;
+procedure FHFilter8i(u, v: PByte; stride, thresh, ithresh, hevt: Integer);
+begin
+  FFilterLoop24(u + 4, 1, stride, 8, thresh, ithresh, hevt);
+  FFilterLoop24(v + 4, 1, stride, 8, thresh, ithresh, hevt);
+end;
+
+// Precompute per-segment / per-mode filter strengths (frame_dec.c)
+procedure VP8PrecomputeFilterStrengths(var D: TVP8Decoder);
+var s, i4x4, baseLevel, level, ilevel: Integer;
+begin
+  if D.FilterType = 0 then Exit;
+  for s := 0 to NUM_MB_SEGMENTS-1 do
+  begin
+    if D.SegHdr.UseSegment then
+    begin
+      baseLevel := D.SegHdr.FilterStrength[s];
+      if not D.SegHdr.AbsoluteDelta then Inc(baseLevel, D.FilterLevel);
+    end else
+      baseLevel := D.FilterLevel;
+    for i4x4 := 0 to 1 do
+    begin
+      level := baseLevel;
+      if D.UseLFDelta then
+      begin
+        Inc(level, D.RefLFDelta[0]);
+        if i4x4 <> 0 then Inc(level, D.ModeLFDelta[0]);
+      end;
+      if level < 0 then level := 0 else if level > 63 then level := 63;
+      if level > 0 then
+      begin
+        ilevel := level;
+        if D.FilterSharpness > 0 then
+        begin
+          if D.FilterSharpness > 4 then ilevel := ilevel shr 2
+          else ilevel := ilevel shr 1;
+          if ilevel > 9 - D.FilterSharpness then ilevel := 9 - D.FilterSharpness;
+        end;
+        if ilevel < 1 then ilevel := 1;
+        D.FStrength[s][i4x4].FILevel := ilevel;
+        D.FStrength[s][i4x4].FLimit  := 2*level + ilevel;
+        if level >= 40 then D.FStrength[s][i4x4].HevThresh := 2
+        else if level >= 15 then D.FStrength[s][i4x4].HevThresh := 1
+        else D.FStrength[s][i4x4].HevThresh := 0;
+      end else
+        D.FStrength[s][i4x4].FLimit := 0;
+      D.FStrength[s][i4x4].FInner := (i4x4 <> 0);
+    end;
+  end;
+end;
+
+// Filter a single macroblock on the full-frame planes
+procedure VP8DoFilter(var D: TVP8Decoder; mbx, mby: Integer);
+var
+  finfo: PVP8FInfo;
+  yBps, uvBps, ilevel, limit, hevt: Integer;
+  yDst, uDst, vDst: PByte;
+begin
+  finfo := D.FInfo + (mby*D.MbW + mbx);
+  limit := finfo^.FLimit;
+  if limit = 0 then Exit;
+  ilevel := finfo^.FILevel;
+  yBps   := D.FYStride;
+  uvBps  := D.FUVStride;
+  yDst   := D.FYPlane + mby*16*yBps + mbx*16;
+  if D.FilterType = 1 then
+  begin
+    if mbx > 0          then FSimpleHFilter16(yDst, yBps, limit + 4);
+    if finfo^.FInner    then FSimpleHFilter16i(yDst, yBps, limit);
+    if mby > 0          then FSimpleVFilter16(yDst, yBps, limit + 4);
+    if finfo^.FInner    then FSimpleVFilter16i(yDst, yBps, limit);
+  end else
+  begin
+    hevt := finfo^.HevThresh;
+    uDst := D.FUPlane + mby*8*uvBps + mbx*8;
+    vDst := D.FVPlane + mby*8*uvBps + mbx*8;
+    if mbx > 0 then
+    begin
+      FHFilter16(yDst, yBps, limit + 4, ilevel, hevt);
+      FHFilter8(uDst, vDst, uvBps, limit + 4, ilevel, hevt);
+    end;
+    if finfo^.FInner then
+    begin
+      FHFilter16i(yDst, yBps, limit, ilevel, hevt);
+      FHFilter8i(uDst, vDst, uvBps, limit, ilevel, hevt);
+    end;
+    if mby > 0 then
+    begin
+      FVFilter16(yDst, yBps, limit + 4, ilevel, hevt);
+      FVFilter8(uDst, vDst, uvBps, limit + 4, ilevel, hevt);
+    end;
+    if finfo^.FInner then
+    begin
+      FVFilter16i(yDst, yBps, limit, ilevel, hevt);
+      FVFilter8i(uDst, vDst, uvBps, limit, ilevel, hevt);
+    end;
+  end;
+end;
+
+procedure VP8FilterFrame(var D: TVP8Decoder);
+var mbx, mby: Integer;
+begin
+  if D.FilterType = 0 then Exit;
+  for mby := 0 to D.MbH-1 do
+    for mbx := 0 to D.MbW-1 do
+      VP8DoFilter(D, mbx, mby);
+end;
+
+// Write one RGB(A) pixel from a (Y,U,V) sample.
+procedure StorePixel(yv, uv, vv: Integer; p: PByte; Mode: TCSMode); inline;
+var r, g, b: Byte;
+begin
+  r := YuvToR(yv, vv);
+  g := YuvToG(yv, uv, vv);
+  b := YuvToB(yv, uv);
+  case Mode of
+    csmRGBA: begin p[0]:=r; p[1]:=g; p[2]:=b; p[3]:=255; end;
+    csmARGB: begin p[0]:=255; p[1]:=r; p[2]:=g; p[3]:=b; end;
+    csmBGRA: begin p[0]:=b; p[1]:=g; p[2]:=r; p[3]:=255; end;
+    csmRGB:  begin p[0]:=r; p[1]:=g; p[2]:=b; end;
+    csmBGR:  begin p[0]:=b; p[1]:=g; p[2]:=r; end;
+  end;
+end;
+
+// Fancy (bilinear) chroma upsampling for a pair of output rows.
+// Faithful port of libwebp UPSAMPLE_FUNC (dsp/upsampling.c).
+procedure UpsamplePair(topY, botY, topU, topV, curU, curV, topDst, botDst: PByte;
+  len, bpp: Integer; Mode: TCSMode);
+var
+  x, lastPair: Integer;
+  tlU, tlV, lU, lV, tU, tV, cU, cV: Integer;
+  avgU, avgV, d12U, d12V, d03U, d03V: Integer;
+begin
+  lastPair := (len - 1) shr 1;
+  tlU := topU[0]; tlV := topV[0];
+  lU  := curU[0]; lV  := curV[0];
+  // first pixel
+  StorePixel(topY[0], (3*tlU + lU + 2) shr 2, (3*tlV + lV + 2) shr 2, topDst, Mode);
+  if botY <> nil then
+    StorePixel(botY[0], (3*lU + tlU + 2) shr 2, (3*lV + tlV + 2) shr 2, botDst, Mode);
+  for x := 1 to lastPair do
+  begin
+    tU := topU[x]; tV := topV[x];
+    cU := curU[x]; cV := curV[x];
+    avgU := tlU + tU + lU + cU + 8;
+    avgV := tlV + tV + lV + cV + 8;
+    d12U := (avgU + 2*(tU + lU)) shr 3;  d12V := (avgV + 2*(tV + lV)) shr 3;
+    d03U := (avgU + 2*(tlU + cU)) shr 3; d03V := (avgV + 2*(tlV + cV)) shr 3;
+    StorePixel(topY[2*x-1], (d12U + tlU) shr 1, (d12V + tlV) shr 1, topDst + (2*x-1)*bpp, Mode);
+    StorePixel(topY[2*x],   (d03U + tU)  shr 1, (d03V + tV)  shr 1, topDst + (2*x)*bpp,   Mode);
+    if botY <> nil then
+    begin
+      StorePixel(botY[2*x-1], (d03U + lU) shr 1, (d03V + lV) shr 1, botDst + (2*x-1)*bpp, Mode);
+      StorePixel(botY[2*x],   (d12U + cU) shr 1, (d12V + cV) shr 1, botDst + (2*x)*bpp,   Mode);
+    end;
+    tlU := tU; tlV := tV; lU := cU; lV := cV;
+  end;
+  if (len and 1) = 0 then
+  begin
+    StorePixel(topY[len-1], (3*tlU + lU + 2) shr 2, (3*tlV + lV + 2) shr 2, topDst + (len-1)*bpp, Mode);
+    if botY <> nil then
+      StorePixel(botY[len-1], (3*lU + tlU + 2) shr 2, (3*lV + tlV + 2) shr 2, botDst + (len-1)*bpp, Mode);
+  end;
+end;
+
+// Convert the (filtered) full-frame YUV planes to RGB in OutBuf, using
+// libwebp-compatible fancy upsampling for the chroma planes.
+procedure VP8EmitFrame(var D: TVP8Decoder);
+var
+  y, cu, W, H, bpp, ys, uvs, os: Integer;
+  fy, fu, fv, ob: PByte;
+begin
+  W := D.PicWidth; H := D.PicHeight;
+  bpp := D.OutBpp;
+  ys := D.FYStride; uvs := D.FUVStride; os := D.OutStride;
+  fy := D.FYPlane; fu := D.FUPlane; fv := D.FVPlane; ob := D.OutBuf;
+  if H <= 0 then Exit;
+
+  // First output row: mirror chroma row 0.
+  UpsamplePair(fy, nil, fu, fv, fu, fv, ob, nil, W, bpp, D.OutputMode);
+  cu := 0;
+  y := 0;
+  while y + 2 < H do
+  begin
+    // top chroma row = cu, cur chroma row = cu+1; outputs rows y+1, y+2
+    UpsamplePair(fy + (y+1)*ys, fy + (y+2)*ys,
+                 fu + cu*uvs, fv + cu*uvs,
+                 fu + (cu+1)*uvs, fv + (cu+1)*uvs,
+                 ob + NativeUInt(y+1)*NativeUInt(os),
+                 ob + NativeUInt(y+2)*NativeUInt(os),
+                 W, bpp, D.OutputMode);
+    Inc(cu);
+    Inc(y, 2);
+  end;
+  // For even height, the last row is produced by mirroring the last chroma row.
+  if (H and 1) = 0 then
+    UpsamplePair(fy + (H-1)*ys, nil,
+                 fu + cu*uvs, fv + cu*uvs, fu + cu*uvs, fv + cu*uvs,
+                 ob + NativeUInt(H-1)*NativeUInt(os), nil, W, bpp, D.OutputMode);
+end;
+
+// ============================================================
 // VP8 FRAME DECODE
 // ============================================================
 
@@ -1921,15 +2307,13 @@ var
   mb: ^TVP8MBData;
   br: ^TVP8Rd;
   info: PVP8MB;
-  yRow, uRow, vRow: PByte;
-  outRow: PByte;
   y, x, ix, iy: Integer;
   topCtx: PByte;    // pointer into D.IntraT for current macroblock's 4 columns
   ymode: Integer;
   leftMode: Integer;  // running left context for I4x4 mode parsing
-  mbPxW: Integer;   // pixel width of current macroblock (16 or partial last)
   yBase, uBase, vBase: PByte;
   j: Integer;
+  finfo: PVP8FInfo;
 begin
   Result := False;
 
@@ -2059,9 +2443,7 @@ begin
           D.IntraL[iy] := leftMode;  // = last decoded mode in this row
         end;
       end;
-      mb^.UVMode := ParseUVMode(br^);
-
-      // --- Residuals from AC partition ---
+      mb^.UVMode := ParseUVMode(br^);      // --- Residuals from AC partition ---
       if not mb^.Skip then
       begin
         VP8ParseResiduals(D, mbx, D.Parts[partIdx], partIdx);
@@ -2070,31 +2452,37 @@ begin
         FillChar(mb^.Coeffs[0], SizeOf(mb^.Coeffs), 0);
         mb^.NonZeroY  := 0;
         mb^.NonZeroUV := 0;
-        // clear NZ context
-        info^.NZ := 0; info^.NZDC := 0;
-        D.MBInfo^.NZ := 0;
+        // Matches C: left->nz = mb->nz = 0; if (!is_i4x4) left->nz_dc = mb->nz_dc = 0;
+        D.MBInfo^.NZ := 0;   // left->nz
+        info^.NZ     := 0;   // mb->nz (current column top context)
+        if not mb^.IsI4x4 then
+        begin
+          D.MBInfo^.NZDC := 0;   // left->nz_dc
+          info^.NZDC     := 0;   // mb->nz_dc
+        end;
       end;
 
-      // --- Reconstruct YUV ---
+      // --- Store per-MB loop-filter info ---
+      if D.FilterType > 0 then
+      begin
+        finfo := D.FInfo + (mby*D.MbW + mbx);
+        finfo^ := D.FStrength[mb^.Segment and 3][Ord(mb^.IsI4x4)];
+        // f_inner |= (MB has any non-zero coefficient)
+        if (mb^.NonZeroY <> 0) or (mb^.NonZeroUV <> 0) then
+          finfo^.FInner := True;
+      end;      // --- Reconstruct YUV ---
       VP8ReconstructMB(D, mbx, hasTop, hasLeft);
 
-      // --- Emit this macroblock's strip to the output ---
-      // YuvBuf holds only the current 16x16 MB; emit only its 16-pixel-wide columns
-      outRow := D.OutBuf + NativeUInt(mby) * 16 * NativeUInt(D.OutStride)
-                         + NativeUInt(mbx) * 16 * NativeUInt(D.OutBpp);
+      // --- Store reconstructed (unfiltered) MB into full-frame planes ---
+      for y := 0 to 15 do
+        Move(D.YuvBuf[Y_OFF + y * BPS],
+             (D.FYPlane + (mby*16 + y)*D.FYStride + mbx*16)^, 16);
+      for y := 0 to 7 do
       begin
-        mbPxW := 16;
-        if (mbx + 1) * 16 > D.PicWidth then mbPxW := D.PicWidth - mbx * 16;
-        for y := 0 to 15 do
-        begin
-          if mby * 16 + y >= D.PicHeight then Break;
-          yRow := @D.YuvBuf[Y_OFF + y * BPS];
-          uRow := @D.YuvBuf[U_OFF + (y shr 1) * BPS];
-          vRow := @D.YuvBuf[V_OFF + (y shr 1) * BPS];
-          EmitRGBRow(yRow, uRow, vRow, mbPxW,
-                     outRow + NativeUInt(y) * NativeUInt(D.OutStride),
-                     D.OutputMode, D.OutBpp);
-        end;
+        Move(D.YuvBuf[U_OFF + y * BPS],
+             (D.FUPlane + (mby*8 + y)*D.FUVStride + mbx*8)^, 8);
+        Move(D.YuvBuf[V_OFF + y * BPS],
+             (D.FVPlane + (mby*8 + y)*D.FUVStride + mbx*8)^, 8);
       end;
     end;
   end;
@@ -2186,253 +2574,1086 @@ end;
 // VP8L (LOSSLESS) DECODER
 // ============================================================
 
-// VP8L uses a different bitstream format and Huffman coding.
-// This is a basic implementation covering the common case.
+// Each group: 5 Huffman tables for (green+len, red, blue, alpha, dist)
+// Tables are dynamically allocated (two-level LUT for codes > 8 bits)
+const
+  HV_MAX_CODELEN = 15;
 
 type
-  TVP8LHuffGroup = record
-    Tables: array[0..4] of array[0..255] of THuffmanCode;
+  TVP8LHuffTable = record
+    E:  PHuffmanCode;  // allocated flat array (root + secondary tables)
+    Sz: Integer;       // total entry count
   end;
 
-// Read the code lengths for a Huffman table using the meta-Huffman codes
-procedure ReadHuffCodeLengths(var BR: TVP8LBitReader;
-  CodeLengthHuff: PHuffmanCode;
-  NumSymbols: Integer;
-  out Lengths: array of Integer);
-var
-  i, sym, code, reps: Integer;
-  prev: Integer;
+  TVP8LHuffGroup = record
+    T: array[0..4] of TVP8LHuffTable;
+  end;
+  PVP8LHuffGroup = ^TVP8LHuffGroup;
+
+// --- Next canonical code key (bit-reversal step) ---
+function VP8LGetNextKey(Key: Cardinal; Len: Integer): Cardinal;
+var step: Cardinal;
 begin
+  step := Cardinal(1) shl (Len - 1);
+  while (Key and step) <> 0 do step := step shr 1;
+  if step <> 0 then Result := (Key and (step - 1)) + step
+  else Result := Key;
+end;
+
+// --- Minimum extra bits needed for next secondary table ---
+function VP8LNextTableBits(Count: PInteger; Len, RootBits: Integer): Integer;
+var left: Integer;
+begin
+  left := 1 shl (Len - RootBits);
+  while Len < HV_MAX_CODELEN do
+  begin
+    Dec(left, Count[Len]);
+    if left <= 0 then Break;
+    Inc(Len);
+    left := left shl 1;
+  end;
+  Result := Len - RootBits;
+end;
+
+// --- Build two-level Huffman LUT (matches libwebp BuildHuffmanTable) ---
+// First call with Table=nil to get size; then allocate and call again to fill.
+// Returns total entries needed, or 0 on error.
+function VP8LHuffBuild(Table: PHuffmanCode; RootBits: Integer;
+  Lengths: PInteger; NumSymbols: Integer): Integer;
+var
+  Count:    array[0..HV_MAX_CODELEN + 1] of Integer;
+  Offset:   array[0..HV_MAX_CODELEN + 1] of Integer;
+  Sorted:   array[0..2327] of Word;
+  Sym, Len, j: Integer;
+  Step, TotalSize, TableBits, TableSize, SecBase: Integer;
+  NumNodes, NumOpen, Sym2, totalNZ: Integer;
+  Low, Mask, Key: Cardinal;
+  Code: THuffmanCode;
+begin
+  Result := 0;
+  FillChar(Count, SizeOf(Count), 0);
+  for Sym := 0 to NumSymbols - 1 do
+  begin
+    Len := Lengths[Sym];
+    if (Len < 0) or (Len > HV_MAX_CODELEN) then begin Exit; end;
+    Inc(Count[Len]);
+  end;
+  if Count[0] = NumSymbols then begin Exit; end;
+  for Len := 1 to HV_MAX_CODELEN do
+    if Count[Len] > (1 shl Len) then begin Exit; end;
+
+  Offset[1] := 0;
+  for Len := 1 to HV_MAX_CODELEN - 1 do
+    Offset[Len + 1] := Offset[Len] + Count[Len];
+  for Sym := 0 to NumSymbols - 1 do
+  begin
+    Len := Lengths[Sym];
+    if Len > 0 then begin Sorted[Offset[Len]] := Word(Sym); Inc(Offset[Len]); end;
+  end;
+  totalNZ := Offset[HV_MAX_CODELEN];
+
+  if totalNZ = 1 then
+  begin
+    if Table <> nil then
+    begin
+      Code.Bits := 0; Code.Value := Sorted[0];
+      for j := 0 to (1 shl RootBits) - 1 do Table[j] := Code;
+    end;
+    Result := 1 shl RootBits;
+    Exit;
+  end;
+
+  // Rebuild Count (Offset[] was incremented during sort)
+  FillChar(Count, SizeOf(Count), 0);
+  for Sym := 0 to NumSymbols - 1 do
+  begin
+    Len := Lengths[Sym];
+    if (Len > 0) and (Len <= HV_MAX_CODELEN) then Inc(Count[Len]);
+  end;
+
+  TotalSize := 1 shl RootBits;
+  Low       := $FFFFFFFF;
+  Mask      := Cardinal(TotalSize - 1);
+  Key       := 0;
+  NumNodes  := 1;
+  NumOpen   := 1;
+  TableSize := 1 shl RootBits;  // initial root size (used for first SecBase advance)
+  TableBits := RootBits;
+  SecBase   := 0;
+  Sym2      := 0;
+
+  // Fill root table (code lengths 1..RootBits)
+  Step := 2;
+  for Len := 1 to RootBits do
+  begin
+    NumOpen := NumOpen shl 1;
+    Inc(NumNodes, NumOpen);
+    Dec(NumOpen, Count[Len]);
+    if NumOpen < 0 then begin Exit; end;
+    while Count[Len] > 0 do
+    begin
+      if Table <> nil then
+      begin
+        Code.Bits  := Byte(Len);
+        Code.Value := Sorted[Sym2];
+        j := Integer(Key);
+        while j < (1 shl RootBits) do begin Table[j] := Code; Inc(j, Step); end;
+      end;
+      Inc(Sym2);
+      Key := VP8LGetNextKey(Key, Len);
+      Dec(Count[Len]);
+    end;
+    Step := Step shl 1;
+  end;
+
+  // Fill secondary tables (code lengths > RootBits)
+  Step := 2;
+  for Len := RootBits + 1 to HV_MAX_CODELEN do
+  begin
+    NumOpen := NumOpen shl 1;
+    Inc(NumNodes, NumOpen);
+    Dec(NumOpen, Count[Len]);
+    if NumOpen < 0 then begin Exit; end;
+    while Count[Len] > 0 do
+    begin
+      if (Key and Mask) <> Low then
+      begin
+        SecBase   := SecBase + TableSize;
+        TableBits := VP8LNextTableBits(@Count[0], Len, RootBits);
+        TableSize := 1 shl TableBits;
+        Inc(TotalSize, TableSize);
+        Low := Key and Mask;
+        if Table <> nil then
+        begin
+          Table[Low].Bits  := Byte(TableBits + RootBits);
+          Table[Low].Value := Word(SecBase - Integer(Low));
+        end;
+      end;
+      if Table <> nil then
+      begin
+        Code.Bits  := Byte(Len - RootBits);
+        Code.Value := Sorted[Sym2];
+        j := Integer(Key shr RootBits);
+        while j < TableSize do begin Table[SecBase + j] := Code; Inc(j, Step); end;
+      end;
+      Inc(Sym2);
+      Key := VP8LGetNextKey(Key, Len);
+      Dec(Count[Len]);
+    end;
+    Step := Step shl 1;
+  end;
+
+  if NumNodes <> 2 * totalNZ - 1 then begin Exit; end;
+  Result := TotalSize;
+end;
+
+// ---- Transform type constants ----
+const
+  VP8L_MAX_TRANSFORMS = 4;
+  VP8L_TT_PREDICTOR  = 0;
+  VP8L_TT_COLORXFORM = 1;
+  VP8L_TT_SUBGREEN   = 2;
+  VP8L_TT_COLORINDEX = 3;
+
+// ---- Transform record ----
+type
+  TVP8LTransform = record
+    TType:   Integer;   // VP8L_TT_*
+    Bits:    Integer;   // block bits (PRED/COLOR) or packing bits (CI)
+    XSize:   Integer;   // original image width before packing
+    YSize:   Integer;
+    Data:    PCardinal; // allocated sub-image (transform data)
+  end;
+
+// ---- VP8L decoder state ----
+type
+  TVP8LState = record
+    BR:           TVP8LBitReader;
+    CacheBits:    Integer;
+    ColorCache:   PCardinal;
+    HuffBits:     Integer;  // 0 = single group
+    HuffW:        Integer;  // huffman image width in tiles
+    HuffImage:    PCardinal;
+    NumGroups:    Integer;
+    Groups:       PVP8LHuffGroup; // allocated array
+  end;
+
+// ---- Read code lengths (code-length alphabet has 19 symbols, fits in 256-entry LUT) ----
+// Faithful port of libwebp ReadHuffmanCodeLengths (incl. max_symbol prefix).
+function VP8LReadCodeLengths(var BR: TVP8LBitReader;
+  CLTable: PHuffmanCode; NumSymbols: Integer; Lengths: PInteger): Boolean;
+var
+  i, sym, reps: Integer;
+  prev: Integer;
+  maxSymbol, lengthNbits: Integer;
+  usePrev, length: Integer;
+  extraBits: array[0..2] of Integer;
+  repOff:    array[0..2] of Integer;
+begin
+  Result := False;
+  extraBits[0] := 2; extraBits[1] := 3; extraBits[2] := 7;
+  repOff[0]    := 3; repOff[1]    := 3; repOff[2]    := 11;
+
+  // Optional max_symbol prefix
+  if VP8LReadBits(BR, 1) <> 0 then
+  begin
+    lengthNbits := 2 + 2 * Integer(VP8LReadBits(BR, 3));
+    maxSymbol   := 2 + Integer(VP8LReadBits(BR, lengthNbits));
+    if maxSymbol > NumSymbols then Exit;
+  end else
+    maxSymbol := NumSymbols;
+
   i := 0; prev := 8;
   while i < NumSymbols do
   begin
-    sym := HuffReadSymbol(BR, CodeLengthHuff, HUFF_LUT_BITS);
-    if sym < 0 then begin Lengths[i] := 0; Inc(i); Continue; end;
+    if maxSymbol = 0 then Break;
+    Dec(maxSymbol);
+    if BR.Available <= 32 then VP8LFillBitWindow(BR);
+    sym := HuffReadSymbol(BR, CLTable, HUFF_LUT_BITS);
+    if sym < 0 then Exit;
     if sym < 16 then
     begin
       Lengths[i] := sym;
       if sym <> 0 then prev := sym;
       Inc(i);
-    end else if sym = 16 then
+    end else
     begin
-      reps := 3 + Integer(VP8LReadBits(BR, 2));
-      for code := 0 to reps-1 do
-        if i < NumSymbols then begin Lengths[i] := prev; Inc(i); end;
-    end else if sym = 17 then
-    begin
-      reps := 3 + Integer(VP8LReadBits(BR, 3));
-      for code := 0 to reps-1 do
-        if i < NumSymbols then begin Lengths[i] := 0; Inc(i); end;
-    end else  // sym = 18
-    begin
-      reps := 11 + Integer(VP8LReadBits(BR, 7));
-      for code := 0 to reps-1 do
-        if i < NumSymbols then begin Lengths[i] := 0; Inc(i); end;
+      usePrev := Ord(sym = 16);
+      reps    := Integer(VP8LReadBits(BR, extraBits[sym - 16])) + repOff[sym - 16];
+      if i + reps > NumSymbols then Exit;
+      if usePrev <> 0 then length := prev else length := 0;
+      while reps > 0 do begin Lengths[i] := length; Inc(i); Dec(reps); end;
     end;
   end;
+  Result := True;
+end;
+
+// ---- Read one Huffman table into TVP8LHuffTable (two-level LUT) ----
+function VP8LReadHuffTable(var BR: TVP8LBitReader; AlphabetSize: Integer;
+  out HT: TVP8LHuffTable): Boolean;
+var
+  isSimple, numSyms, lenBit, sym1, sym2: Integer;
+  clLengths:   array[0..18] of Integer;
+  clTable:     array[0..255] of THuffmanCode;
+  codeLengths: array[0..2327] of Integer;
+  numCodes, j, tsz: Integer;
+begin
+  Result   := False;
+  HT.E     := nil;
+  HT.Sz    := 0;
+  isSimple := Integer(VP8LReadBits(BR, 1));
+  FillChar(codeLengths[0], AlphabetSize * SizeOf(Integer), 0);
+  if isSimple <> 0 then
+  begin
+    numSyms := Integer(VP8LReadBits(BR, 1)) + 1;
+    lenBit  := Integer(VP8LReadBits(BR, 1));
+    if lenBit = 0 then sym1 := Integer(VP8LReadBits(BR, 1))
+    else               sym1 := Integer(VP8LReadBits(BR, 8));
+    if (sym1 >= 0) and (sym1 < AlphabetSize) then codeLengths[sym1] := 1;
+    sym2 := -1;
+    if numSyms = 2 then
+    begin
+      sym2 := Integer(VP8LReadBits(BR, 8));
+      if (sym2 >= 0) and (sym2 < AlphabetSize) then codeLengths[sym2] := 1;
+    end;
+  end else
+  begin
+    FillChar(clLengths, SizeOf(clLengths), 0);
+    numCodes := Integer(VP8LReadBits(BR, 4)) + 4;
+    for j := 0 to numCodes - 1 do
+      clLengths[kCodeLengthCodeOrder[j]] := Integer(VP8LReadBits(BR, 3));
+    if not VP8LBuildHuffmanTable(clLengths, 19, @clTable[0], HUFF_LUT_BITS) then
+    begin
+      Exit;
+    end;
+    if not VP8LReadCodeLengths(BR, @clTable[0], AlphabetSize, @codeLengths[0]) then
+    begin
+      Exit;
+    end;
+  end;
+  tsz := VP8LHuffBuild(nil, HUFF_LUT_BITS, @codeLengths[0], AlphabetSize);
+  if tsz = 0 then Exit;
+  HT.E  := AllocMem(tsz * SizeOf(THuffmanCode));
+  HT.Sz := tsz;
+  if VP8LHuffBuild(HT.E, HUFF_LUT_BITS, @codeLengths[0], AlphabetSize) = 0 then
+  begin
+    FreeMem(HT.E); HT.E := nil; HT.Sz := 0;
+    Exit;
+  end;
+  Result := True;
+end;
+
+// ---- Free dynamically allocated tables inside one group ----
+procedure VP8LFreeGroupTables(grp: PVP8LHuffGroup);
+var j: Integer;
+begin
+  for j := 0 to 4 do
+    if grp^.T[j].E <> nil then begin FreeMem(grp^.T[j].E); grp^.T[j].E := nil; end;
+end;
+
+// ---- Read NumGroups sets of 5 Huffman tables ----
+function VP8LReadGroups(var BR: TVP8LBitReader; NumGroups: Integer;
+  GreenAlphaSize: Integer; Groups: PVP8LHuffGroup): Boolean;
+var
+  g, j: Integer;
+  alphabets: array[0..4] of Integer;
+begin
+  Result       := False;
+  alphabets[0] := GreenAlphaSize;
+  alphabets[1] := 256; alphabets[2] := 256;
+  alphabets[3] := 256; alphabets[4] := 40;
+  for g := 0 to NumGroups - 1 do
+    for j := 0 to 4 do
+      if not VP8LReadHuffTable(BR, alphabets[j], Groups[g].T[j]) then
+      begin
+        Exit;
+      end;
+  Result := True;
+end;
+
+// ---- Symbol read with two-level LUT ----
+function VP8LReadSym(var BR: TVP8LBitReader; const HT: TVP8LHuffTable): Integer;
+var
+  key:     Cardinal;
+  e:       PHuffmanCode;
+  nbits:   Integer;
+  xkey:    Cardinal;
+begin
+  key   := VP8LPeekBits(BR, HUFF_LUT_BITS);
+  e     := @HT.E[key];
+  nbits := Integer(e^.Bits) - HUFF_LUT_BITS;
+  if nbits > 0 then
+  begin
+    BR.Val := BR.Val shr HUFF_LUT_BITS;
+    Dec(BR.Available, HUFF_LUT_BITS);
+    if BR.Available <= 32 then VP8LFillBitWindow(BR);
+    xkey := VP8LPeekBits(BR, nbits);
+    Inc(e, Integer(e^.Value) + Integer(xkey));
+  end;
+  BR.Val := BR.Val shr e^.Bits;
+  Dec(BR.Available, e^.Bits);
+  if BR.Available <= 32 then VP8LFillBitWindow(BR);
+  Result := Integer(e^.Value);
+end;
+
+// ---- Convert plane-code to pixel distance ----
+function VP8LPlaneCodeToDist(XSize, PlaneCode: Integer): Integer; inline;
+var
+  dc, yoff, xoff, d: Integer;
+begin
+  if PlaneCode > 120 then
+    Result := PlaneCode - 120
+  else
+  begin
+    dc   := Integer(kCodeToPlane[PlaneCode - 1]);
+    yoff := dc shr 4;
+    xoff := 8 - (dc and $F);
+    d    := yoff * XSize + xoff;
+    if d < 1 then d := 1;
+    Result := d;
+  end;
+end;
+
+// ---- Expand copy code prefix into actual length/distance value ----
+function VP8LCopyCode(sym: Integer; var BR: TVP8LBitReader): Integer; inline;
+var
+  extra, offset: Integer;
+begin
+  if sym < 4 then
+    Result := sym + 1
+  else
+  begin
+    extra  := (sym - 2) shr 1;
+    offset := (2 + (sym and 1)) shl extra;
+    Result := offset + Integer(VP8LReadBits(BR, extra)) + 1;
+  end;
+end;
+
+// ---- Per-channel wrapping add (for predictor inverse) ----
+function VP8LAddPx(a, b: Cardinal): Cardinal; inline;
+begin
+  Result := ((a + b) and $FF)
+    or ((((a shr 8) + (b shr 8)) and $FF) shl 8)
+    or ((((a shr 16) + (b shr 16)) and $FF) shl 16)
+    or ((((a shr 24) + (b shr 24)) and $FF) shl 24);
+end;
+
+// ---- Predictor averages ----
+function PAvg2(a, b: Cardinal): Cardinal; inline;
+begin
+  Result := (((a xor b) and $FEFEFEFE) shr 1) + (a and b);
+end;
+
+function PAvg3(a, b, c: Cardinal): Cardinal; inline;
+begin
+  Result := PAvg2(PAvg2(a, c), b);
+end;
+
+function PAvg4(a, b, c, d: Cardinal): Cardinal; inline;
+begin
+  Result := PAvg2(PAvg2(a, b), PAvg2(c, d));
+end;
+
+function Clip8(v: Integer): Integer; inline;
+begin
+  if v < 0 then Result := 0 else if v > 255 then Result := 255 else Result := v;
+end;
+
+function PSelect(a, b, c: Cardinal): Cardinal; inline;
+var
+  pa: Integer;
+begin
+  pa := (Abs(Integer((a shr 24) and $FF) - Integer((c shr 24) and $FF))
+       - Abs(Integer((b shr 24) and $FF) - Integer((c shr 24) and $FF)))
+      + (Abs(Integer((a shr 16) and $FF) - Integer((c shr 16) and $FF))
+       - Abs(Integer((b shr 16) and $FF) - Integer((c shr 16) and $FF)))
+      + (Abs(Integer((a shr 8) and $FF) - Integer((c shr 8) and $FF))
+       - Abs(Integer((b shr 8) and $FF) - Integer((c shr 8) and $FF)))
+      + (Abs(Integer(a and $FF) - Integer(c and $FF))
+       - Abs(Integer(b and $FF) - Integer(c and $FF)));
+  // libwebp: Sub3(a,b,c)=|b-c|-|a-c|; returns a when sum<=0. Our pa has the
+  // opposite sign (|a-c|-|b-c|), so return a when pa >= 0.
+  if pa >= 0 then Result := a else Result := b;
+end;
+
+function PClampFull(c0, c1, c2: Cardinal): Cardinal; inline;
+begin
+  Result :=
+    (Cardinal(Clip8(Integer(c0 shr 24) + Integer(c1 shr 24) - Integer(c2 shr 24))) shl 24) or
+    (Cardinal(Clip8(Integer((c0 shr 16) and $FF) + Integer((c1 shr 16) and $FF) - Integer((c2 shr 16) and $FF))) shl 16) or
+    (Cardinal(Clip8(Integer((c0 shr 8) and $FF) + Integer((c1 shr 8) and $FF) - Integer((c2 shr 8) and $FF))) shl 8) or
+    Cardinal(Clip8(Integer(c0 and $FF) + Integer(c1 and $FF) - Integer(c2 and $FF)));
+end;
+
+function PClampHalf(c0, c1, c2: Cardinal): Cardinal; inline;
+var
+  av: Cardinal;
+  aa, ra, ga, ba, ac, rc, gc, bc: Integer;
+begin
+  av := PAvg2(c0, c1);
+  aa := Integer(av shr 24) and $FF;  ac := Integer(c2 shr 24) and $FF;
+  ra := Integer((av shr 16) and $FF); rc := Integer((c2 shr 16) and $FF);
+  ga := Integer((av shr 8) and $FF);  gc := Integer((c2 shr 8) and $FF);
+  ba := Integer(av and $FF);           bc := Integer(c2 and $FF);
+  Result :=
+    (Cardinal(Clip8(aa + (aa - ac) div 2)) shl 24) or
+    (Cardinal(Clip8(ra + (ra - rc) div 2)) shl 16) or
+    (Cardinal(Clip8(ga + (ga - gc) div 2)) shl 8) or
+     Cardinal(Clip8(ba + (ba - bc) div 2));
+end;
+
+function VP8LPredict(mode: Integer; left, top, topLeft, topRight: Cardinal): Cardinal; inline;
+begin
+  case mode of
+    0:  Result := $FF000000;
+    1:  Result := left;
+    2:  Result := top;
+    3:  Result := topRight;
+    4:  Result := topLeft;
+    5:  Result := PAvg3(left, top, topRight);
+    6:  Result := PAvg2(left, topLeft);
+    7:  Result := PAvg2(left, top);
+    8:  Result := PAvg2(topLeft, top);
+    9:  Result := PAvg2(top, topRight);
+    10: Result := PAvg4(left, topLeft, top, topRight);
+    11: Result := PSelect(top, left, topLeft);
+    12: Result := PClampFull(left, top, topLeft);
+    13: Result := PClampHalf(left, top, topLeft);
+    else Result := $FF000000;
+  end;
+end;
+
+// ---- Inverse SubGreen: add green to red and blue ----
+procedure VP8LInvSubGreen(Pixels: PCardinal; Count: Integer);
+var i: Integer; px, g: Cardinal;
+begin
+  for i := 0 to Count - 1 do
+  begin
+    px := Pixels[i];
+    g  := (px shr 8) and $FF;
+    Pixels[i] := (px and $FF00FF00)
+               or (((px shr 16) and $FF) + g) and $FF shl 16
+               or ((px and $FF) + g) and $FF;
+  end;
+end;
+
+// ---- Inverse Color Transform ----
+function CTDelta(t, c: Integer): Integer; inline;
+begin
+  if t >= 128 then Dec(t, 256);
+  if c >= 128 then Dec(c, 256);
+  Result := SarI(t * c, 5);  // arithmetic shift (C does >>5 on signed int)
+end;
+
+procedure VP8LInvColorXform(TData: PCardinal; TBits, W: Integer;
+  Pixels: PCardinal; Count: Integer);
+var
+  i, tw, tx, ty, tileIdx: Integer;
+  px, td: Cardinal;
+  g, r, b: Integer;
+begin
+  tw := 1 shl TBits;
+  for i := 0 to Count - 1 do
+  begin
+    tx := (i mod W) shr TBits;
+    ty := (i div W) shr TBits;
+    tileIdx := ty * ((W + tw - 1) shr TBits) + tx;
+    td := TData[tileIdx];
+    px := Pixels[i];
+    g  := Integer((px shr 8) and $FF);
+    r  := Integer((px shr 16) and $FF);
+    b  := Integer(px and $FF);
+    r  := (r + CTDelta(td and $FF, g)) and $FF;
+    b  := (b + CTDelta((td shr 8) and $FF, g) + CTDelta((td shr 16) and $FF, r)) and $FF;
+    Pixels[i] := (px and $FF00FF00) or (Cardinal(r) shl 16) or Cardinal(b);
+  end;
+end;
+
+// ---- Inverse Predictor Transform ----
+procedure VP8LInvPredictor(TData: PCardinal; TBits, W, H: Integer;
+  Pixels: PCardinal);
+var
+  x, y, tw, tileW, tileIdx: Integer;
+  idx: Integer;
+  pred, residual: Cardinal;
+  mode: Integer;
+  topRow, topRowPrev: PCardinal;
+begin
+  tw := 1 shl TBits;
+  // First row: mode=1 (left prediction) for pixel 0, then mode=1 for rest
+  // Actually: pixel 0 uses mode=0 (black), pixels 1+ use mode=1 (left)
+  // This matches libwebp: PredictorAdd0_C for x=0 y=0, PredictorAdd1_C for rest of first row
+  // Then for y>0: x=0 uses mode=2 (top), rest uses mode from TData
+
+  // Process first row
+  Pixels[0] := VP8LAddPx(Pixels[0], $FF000000);
+  for x := 1 to W - 1 do
+    Pixels[x] := VP8LAddPx(Pixels[x], Pixels[x - 1]);
+
+  // Process remaining rows
+  for y := 1 to H - 1 do
+  begin
+    idx := y * W;
+    // First pixel of each row: mode=2 (top)
+    Pixels[idx] := VP8LAddPx(Pixels[idx], Pixels[idx - W]);
+    for x := 1 to W - 1 do
+    begin
+      // Get tile's predictor mode (from green channel >> 8, shifted into bits 8..11)
+      tileIdx := (y shr TBits) * ((W + tw - 1) shr TBits) + (x shr TBits);
+      mode := Integer((TData[tileIdx] shr 8) and $F);
+      pred := VP8LPredict(mode,
+                Pixels[idx + x - 1],       // left
+                Pixels[idx + x - W],        // top
+                Pixels[idx + x - W - 1],    // top-left
+                Pixels[idx + x - W + 1]);   // top-right (clamp at W-1 is done by caller)
+      Pixels[idx + x] := VP8LAddPx(Pixels[idx + x], pred);
+    end;
+  end;
+end;
+
+// ---- Inverse Color Indexing ----
+// OrigW is the width before packing; W is the encoded (compressed) width
+procedure VP8LInvColorIndex(Palette: PCardinal; PackBits: Integer;
+  OrigW: Integer; Pixels: PCardinal; W, H: Integer);
+var
+  bpp, ppb, bmask, i: Integer;
+  x, y, srcIdx, outIdx, idx: Integer;
+  packedByte: Cardinal;
+  outBuf: PCardinal;
+begin
+  if PackBits = 0 then
+  begin
+    for srcIdx := 0 to W * H - 1 do
+    begin
+      idx := Integer((Pixels[srcIdx] shr 8) and $FF);
+      Pixels[srcIdx] := Palette[idx];
+    end;
+  end else
+  begin
+    bpp   := 8 shr PackBits;
+    ppb   := 1 shl PackBits;
+    bmask := (1 shl bpp) - 1;
+    outBuf := AllocMem(OrigW * H * SizeOf(Cardinal));
+    outIdx := 0;
+    srcIdx := 0;
+    for y := 0 to H - 1 do
+    begin
+      x := 0;
+      while x < OrigW do
+      begin
+        packedByte := (Pixels[srcIdx] shr 8) and $FF;
+        Inc(srcIdx);
+        for i := 0 to ppb - 1 do
+        begin
+          if x >= OrigW then Break;
+          outBuf[outIdx] := Palette[packedByte and bmask];
+          packedByte := packedByte shr bpp;
+          Inc(x);
+          Inc(outIdx);
+        end;
+      end;
+    end;
+    Move(outBuf^, Pixels^, OrigW * H * SizeOf(Cardinal));
+    FreeMem(outBuf);
+  end;
+end;
+
+// ---- AddPixels delta-expand palette ----
+procedure VP8LExpandPalette(Palette: PCardinal; N: Integer);
+var i: Integer;
+begin
+  for i := 1 to N - 1 do
+    Palette[i] := VP8LAddPx(Palette[i], Palette[i - 1]);
+end;
+
+// ---- Build the full color map (matches libwebp ExpandColorMap) ----
+// Cumulative-add the numColors entries, then pad to (1 shl (8 shr bits))
+// entries with zeros ("black tail"), so out-of-range indices read 0.
+function VP8LBuildColorMap(SubPix: PCardinal; NumColors, Bits: Integer): PCardinal;
+var
+  finalN, i: Integer;
+begin
+  finalN := 1 shl (8 shr Bits);
+  Result := AllocMem(finalN * SizeOf(Cardinal));  // zero-filled tail
+  if NumColors > 0 then Result[0] := SubPix[0];
+  for i := 1 to NumColors - 1 do
+    Result[i] := VP8LAddPx(SubPix[i], Result[i - 1]);
+end;
+
+// ---- Forward declaration for recursive sub-image decode ----
+function VP8LDecodeSubImage(var BR: TVP8LBitReader; SW, SH: Integer;
+  out Pixels: PCardinal): Boolean; forward;
+
+// ---- Decode pixels using state (no transforms applied here) ----
+function VP8LDecodePixels(var S: TVP8LState; Pixels: PCardinal; W, H: Integer): Boolean;
+var
+  nPix, pidx, x, y, i: Integer;
+  sym, length, dcode, pdist, sidx: Integer;
+  green, red, blue, alpha: Cardinal;
+  px: Cardinal;
+  cidx: Integer;
+  grpIdx: Integer;
+  grp: PVP8LHuffGroup;
+begin
+  Result := False;
+  nPix   := W * H;
+  pidx   := 0; x := 0; y := 0;
+  while pidx < nPix do
+  begin
+    if S.HuffBits > 0 then
+    begin
+      grpIdx := Integer(S.HuffImage[(y shr S.HuffBits) * S.HuffW + (x shr S.HuffBits)]);
+      grp := @S.Groups[grpIdx];
+    end else
+      grp := @S.Groups[0];
+
+    sym := VP8LReadSym(S.BR, grp^.T[0]);
+    if sym < 0 then Exit;
+
+    if sym < 256 then
+    begin
+      green := Cardinal(sym);
+      red   := Cardinal(VP8LReadSym(S.BR, grp^.T[1]));
+      blue  := Cardinal(VP8LReadSym(S.BR, grp^.T[2]));
+      alpha := Cardinal(VP8LReadSym(S.BR, grp^.T[3]));
+      px := (alpha shl 24) or (red shl 16) or (green shl 8) or blue;
+      Pixels[pidx] := px;
+      if S.CacheBits > 0 then
+      begin
+        cidx := Integer(Cardinal(px * Cardinal($1E35A7BD)) shr (32 - S.CacheBits));
+        S.ColorCache[cidx] := px;
+      end;
+      Inc(pidx); Inc(x); if x >= W then begin x := 0; Inc(y); end;
+    end else if sym < 256 + 24 then
+    begin
+      length := VP8LCopyCode(sym - 256, S.BR);
+      dcode  := VP8LReadSym(S.BR, grp^.T[4]);
+      if dcode < 0 then Exit;
+      pdist := VP8LPlaneCodeToDist(W, VP8LCopyCode(dcode, S.BR));
+      if (pdist < 1) or (pdist > pidx) then Exit;  // invalid back-reference
+      // Standard LZ77 copy: read pdist behind, advancing both (handles overlap)
+      for i := 0 to length - 1 do
+      begin
+        if pidx >= nPix then Break;
+        px := Pixels[pidx - pdist];
+        Pixels[pidx] := px;
+        if S.CacheBits > 0 then
+        begin
+          cidx := Integer(Cardinal(px * Cardinal($1E35A7BD)) shr (32 - S.CacheBits));
+          S.ColorCache[cidx] := px;
+        end;
+        Inc(pidx); Inc(x); if x >= W then begin x := 0; Inc(y); end;
+      end;
+    end else if (S.CacheBits > 0) and (sym < 256 + 24 + (1 shl S.CacheBits)) then
+    begin
+      cidx := sym - 256 - 24;
+      px := S.ColorCache[cidx];
+      Pixels[pidx] := px;
+      Inc(pidx); Inc(x); if x >= W then begin x := 0; Inc(y); end;
+    end else
+    begin
+      Inc(pidx); Inc(x); if x >= W then begin x := 0; Inc(y); end;
+    end;
+  end;
+  Result := True;
+end;
+
+// ---- Setup state from BR: color-cache + meta-huffman + huffman tables ----
+// After call, BR is advanced past all table data
+// AllowMeta = True only for the top-level (level0) image stream; sub-images
+// (entropy image, transform data) must NOT read a meta-huffman bit.
+function VP8LSetupState(var BR: TVP8LBitReader; W, H: Integer;
+  AllowMeta: Boolean; var S: TVP8LState): Boolean;
+var
+  cacheBit, metaBit: Integer;
+  numPix, i, g, gi: Integer;
+  greenAlpha: Integer;
+  grpsBuf: PVP8LHuffGroup;
+  cacheSz: Integer;
+  huffH: Integer;
+begin
+  Result := False;
+  FillChar(S, SizeOf(S), 0);
+  S.BR := BR;
+
+  // Color cache
+  cacheBit := Integer(VP8LReadBits(S.BR, 1));
+  if cacheBit <> 0 then
+  begin
+    S.CacheBits := Integer(VP8LReadBits(S.BR, 4));
+    if (S.CacheBits < 1) or (S.CacheBits > 11) then Exit;
+    S.ColorCache := AllocMem((1 shl S.CacheBits) * SizeOf(Cardinal));
+  end;
+  greenAlpha := 280;
+  if S.CacheBits > 0 then Inc(greenAlpha, 1 shl S.CacheBits);
+
+  // Meta-Huffman (only for the top-level image stream)
+  if AllowMeta then metaBit := Integer(VP8LReadBits(S.BR, 1))
+  else              metaBit := 0;
+  if metaBit <> 0 then
+  begin
+    S.HuffBits := Integer(VP8LReadBits(S.BR, 3)) + 2;
+    S.HuffW    := (W + (1 shl S.HuffBits) - 1) shr S.HuffBits;
+    huffH      := (H + (1 shl S.HuffBits) - 1) shr S.HuffBits;
+    if not VP8LDecodeSubImage(S.BR, S.HuffW, huffH, S.HuffImage) then
+    begin
+      if S.ColorCache <> nil then FreeMem(S.ColorCache);
+      Exit;
+    end;
+    numPix := S.HuffW * huffH;
+    S.NumGroups := 0;
+    for i := 0 to numPix - 1 do
+    begin
+      g := Integer((S.HuffImage[i] shr 8) and $FFFF);
+      S.HuffImage[i] := Cardinal(g);
+      if g >= S.NumGroups then S.NumGroups := g + 1;
+    end;
+    if S.NumGroups = 0 then S.NumGroups := 1;
+  end else
+  begin
+    S.HuffBits  := 0;
+    S.NumGroups := 1;
+  end;
+
+  grpsBuf := AllocMem(S.NumGroups * SizeOf(TVP8LHuffGroup));
+  S.Groups := grpsBuf;
+  if not VP8LReadGroups(S.BR, S.NumGroups, greenAlpha, S.Groups) then
+  begin
+    for gi := 0 to S.NumGroups - 1 do VP8LFreeGroupTables(@S.Groups[gi]);
+    FreeMem(grpsBuf); S.Groups := nil;
+    if S.ColorCache <> nil then begin FreeMem(S.ColorCache); S.ColorCache := nil; end;
+    if S.HuffImage  <> nil then begin FreeMem(S.HuffImage);  S.HuffImage  := nil; end;
+    Exit;
+  end;
+
+  BR := S.BR;
+  Result := True;
+end;
+
+procedure VP8LFreeState(var S: TVP8LState);
+var g: Integer;
+begin
+  if S.Groups <> nil then
+  begin
+    for g := 0 to S.NumGroups - 1 do VP8LFreeGroupTables(@S.Groups[g]);
+    FreeMem(S.Groups);
+    S.Groups := nil;
+  end;
+  if S.ColorCache <> nil then begin FreeMem(S.ColorCache); S.ColorCache := nil; end;
+  if S.HuffImage  <> nil then begin FreeMem(S.HuffImage);  S.HuffImage  := nil; end;
+end;
+
+// ---- Decode a sub-image (for transform metadata or meta-huffman index) ----
+// No transforms inside sub-images; uses VP8LSetupState + VP8LDecodePixels.
+function VP8LDecodeSubImage(var BR: TVP8LBitReader; SW, SH: Integer;
+  out Pixels: PCardinal): Boolean;
+var
+  S:   TVP8LState;
+  nPx: Integer;
+begin
+  Result := False;
+  Pixels := nil;
+  FillChar(S, SizeOf(S), 0);
+  if not VP8LSetupState(BR, SW, SH, False, S) then  // sub-image: no meta-huffman
+  begin
+    VP8LFreeState(S);
+    Exit;
+  end;
+  nPx    := SW * SH;
+  Pixels := AllocMem(nPx * SizeOf(Cardinal));
+  Result := VP8LDecodePixels(S, Pixels, SW, SH);
+  if not Result then begin FreeMem(Pixels); Pixels := nil; end;
+  BR := S.BR;
+  VP8LFreeState(S);
+end;
+
+// ---- Full VP8L decode ----
+// Core VP8L decode: from transforms through inverse transforms.
+// BR must be positioned right after the (already-read) image dimensions.
+// Returns internal ARGB pixels (0xAARRGGBB), NOT R/B swapped. Caller frees.
+function VP8LDecodeBody(var BR: TVP8LBitReader; w, h: Integer;
+  out pixels: PCardinal): Boolean;
+var
+  encW:        Integer;  // encoded (possibly packed) width
+  i, t:        Integer;
+  transforms:  array[0..VP8L_MAX_TRANSFORMS - 1] of TVP8LTransform;
+  numT:        Integer;
+  ttType:      Integer;
+  ttBits:      Integer;
+  numColors:   Integer;
+  subPix:      PCardinal;
+  S:           TVP8LState;
+  nPix:        Integer;
+  ok:          Boolean;
+begin
+  Result := False;
+  pixels := nil;
+  encW   := w;
+  numT   := 0;
+  FillChar(transforms, SizeOf(transforms), 0);
+
+  // Read transforms
+  while VP8LReadBits(BR, 1) <> 0 do
+  begin
+    if numT >= VP8L_MAX_TRANSFORMS then begin
+      for i := 0 to numT-1 do
+        if transforms[i].Data <> nil then FreeMem(transforms[i].Data);
+      Exit;
+    end;
+    ttType := Integer(VP8LReadBits(BR, 2));
+    transforms[numT].TType := ttType;
+    transforms[numT].XSize := encW;
+    transforms[numT].YSize := h;
+    case ttType of
+      VP8L_TT_PREDICTOR, VP8L_TT_COLORXFORM:
+      begin
+        ttBits := Integer(VP8LReadBits(BR, 3)) + 2;
+        transforms[numT].Bits := ttBits;
+        if not VP8LDecodeSubImage(BR,
+               (encW + (1 shl ttBits) - 1) shr ttBits,
+               (h    + (1 shl ttBits) - 1) shr ttBits,
+               subPix) then
+        begin
+          for i := 0 to numT-1 do
+            if transforms[i].Data <> nil then FreeMem(transforms[i].Data);
+          Exit;
+        end;
+        transforms[numT].Data := subPix;
+      end;
+      VP8L_TT_SUBGREEN: ; // no data
+      VP8L_TT_COLORINDEX:
+      begin
+        numColors := Integer(VP8LReadBits(BR, 8)) + 1;
+        if numColors > 16      then ttBits := 0
+        else if numColors > 4  then ttBits := 1
+        else if numColors > 2  then ttBits := 2
+        else                        ttBits := 3;
+        transforms[numT].Bits := ttBits;
+        if not VP8LDecodeSubImage(BR, numColors, 1, subPix) then
+        begin
+          for i := 0 to numT-1 do
+            if transforms[i].Data <> nil then FreeMem(transforms[i].Data);
+          Exit;
+        end;
+        transforms[numT].Data := VP8LBuildColorMap(subPix, numColors, ttBits);
+        FreeMem(subPix);
+        if ttBits > 0 then
+          encW := (w + (1 shl ttBits) - 1) shr ttBits;
+      end;
+    end;
+    Inc(numT);
+  end;
+
+  // Setup Huffman state (color cache + meta-huffman + tables)
+  FillChar(S, SizeOf(S), 0);
+  if not VP8LSetupState(BR, encW, h, True, S) then  // top-level: allow meta-huffman
+  begin
+    VP8LFreeState(S);
+    for i := 0 to numT-1 do
+      if transforms[i].Data <> nil then FreeMem(transforms[i].Data);
+    Exit;
+  end;
+
+  // Decode pixels at encoded width (allocate w*h for COLOR_INDEX expansion)
+  nPix   := w * h;
+  pixels := AllocMem(nPix * SizeOf(Cardinal));
+  ok     := VP8LDecodePixels(S, pixels, encW, h);
+  VP8LFreeState(S);
+
+  if not ok then
+  begin
+    FreeMem(pixels); pixels := nil;
+    for i := 0 to numT-1 do
+      if transforms[i].Data <> nil then FreeMem(transforms[i].Data);
+    Exit;
+  end;
+
+  // Apply inverse transforms in reverse order (last-decoded first)
+  for t := numT - 1 downto 0 do
+  begin
+    case transforms[t].TType of
+      VP8L_TT_SUBGREEN:
+        VP8LInvSubGreen(pixels, encW * h);
+      VP8L_TT_COLORXFORM:
+        VP8LInvColorXform(transforms[t].Data, transforms[t].Bits, encW, pixels, encW * h);
+      VP8L_TT_PREDICTOR:
+        VP8LInvPredictor(transforms[t].Data, transforms[t].Bits, encW, h, pixels);
+      VP8L_TT_COLORINDEX:
+      begin
+        VP8LInvColorIndex(transforms[t].Data, transforms[t].Bits, w, pixels, encW, h);
+        encW := w; // restore original width
+      end;
+    end;
+    if transforms[t].Data <> nil then FreeMem(transforms[t].Data);
+  end;
+
+  Result := True;
 end;
 
 function VP8LDecode(Data: PByte; Size: NativeUInt;
   out PixBuf: PByte; out Width, Height: Integer): Boolean;
 var
   BR:        TVP8LBitReader;
-  w, h:      Integer;
-  alphUsed:  Boolean;
-  version:   Integer;
-  numPixels: Integer;
-  i, x, y:   Integer;
-  // Transform flags
-  hasPredictor:   Boolean;
-  hasColorXform:  Boolean;
-  hasSubGreen:    Boolean;
-  hasColorIndex:  Boolean;
-  ciSize:         Integer;
-  // Huffman tables
-  hg:             TVP8LHuffGroup;
-  clLengths:      array[0..18] of Integer;
-  clTable:        array[0..255] of THuffmanCode;
-  codeLengths:    array[0..4095] of Integer;
-  numCodes:       Integer;
-  // Decode
-  pixel:          Cardinal;
-  green, red, blue, alpha: Byte;
-  sym:            Integer;
-  dist, length:   Integer;
-  backX, backY:   Integer;
-  pSrc, pDst:     PByte;
-  pixelIdx:       Integer;
-  outBuf:         PByte;
+  w, h, i:   Integer;
+  pixels:    PCardinal;
+  alphaUsed: Integer;
 begin
   Result := False;
   PixBuf := nil;
   Width  := 0;
   Height := 0;
-
   if Size < 5 then Exit;
-  // Signature
   if Data[0] <> $2F then Exit;
-  VP8LInitBitReader(BR, Data + 1, Size - 1);
 
+  VP8LInitBitReader(BR, Data + 1, Size - 1);
   w := Integer(VP8LReadBits(BR, 14)) + 1;
   h := Integer(VP8LReadBits(BR, 14)) + 1;
-  alphUsed := VP8LReadBits(BR, 1) <> 0;
-  version  := Integer(VP8LReadBits(BR, 3));
-  if version <> 0 then Exit;
+  alphaUsed := Integer(VP8LReadBits(BR, 1)); // alpha_is_used
+  if VP8LReadBits(BR, 3) <> 0 then Exit; // version
+  Width  := w; Height := h;
 
-  Width  := w;
-  Height := h;
+  if not VP8LDecodeBody(BR, w, h, pixels) then Exit;
 
-  // Skip transforms for now (just mark all absent)
-  hasPredictor  := False;
-  hasColorXform := False;
-  hasSubGreen   := False;
-  hasColorIndex := False;
+  // Convert internal ARGB (0xAARRGGBB, memory B,G,R,A) to RGBA byte order
+  // by swapping the R and B bytes, so the returned buffer is true RGBA.
+  // If alpha_is_used = 0, the image is opaque: force alpha to 0xFF.
+  if alphaUsed = 0 then
+    for i := 0 to w * h - 1 do
+      pixels[i] := $FF000000
+                or (pixels[i] and $0000FF00)
+                or ((pixels[i] and $000000FF) shl 16)
+                or ((pixels[i] shr 16) and $000000FF)
+  else
+    for i := 0 to w * h - 1 do
+      pixels[i] := (pixels[i] and $FF00FF00)
+                or ((pixels[i] and $000000FF) shl 16)
+                or ((pixels[i] shr 16) and $000000FF);
 
-  // Check for transforms
-  while VP8LReadBits(BR, 1) <> 0 do
+  PixBuf := PByte(pixels);
+  Result := True;
+end;
+
+// ---- Alpha plane decode (ALPH chunk) ----
+// Spatial unfilter (in-place, per row; prev = previous row, nil for row 0).
+procedure VP8UnfilterAlpha(Filter: Integer; Plane: PByte; W, H: Integer);
+var
+  y, i, g, pred: Integer;
+  cur, prev: PByte;
+begin
+  if Filter = 0 then Exit;  // WEBP_FILTER_NONE
+  prev := nil;
+  for y := 0 to H - 1 do
   begin
-    case VP8LReadBits(BR, 2) of
-      0: hasPredictor  := True;
-      1: hasColorXform := True;
-      2: hasSubGreen   := True;
-      3:
+    cur := Plane + y * W;
+    case Filter of
+      1: // HORIZONTAL
       begin
-        hasColorIndex := True;
-        ciSize := Integer(VP8LReadBits(BR, 8)) + 1;
+        if prev = nil then pred := 0 else pred := prev[0];
+        cur[0] := Byte(pred + cur[0]);
+        for i := 1 to W - 1 do cur[i] := Byte(cur[i-1] + cur[i]);
       end;
-    end;
-    // Skip transform data — just note presence for now
-    // (A full implementation would decode each transform's metadata here)
-    // For now, if any transform is present, bail with unimplemented
-    if hasPredictor or hasColorXform then Exit;  // TODO: implement
-  end;
-
-  // Read meta-Huffman header
-  // huffman_bits = VP8LReadBits(BR, 3) + 2 (number of huffman groups bits)
-  // For simple case: 0 = single group
-  if VP8LReadBits(BR, 1) <> 0 then Exit;  // meta-Huffman not supported yet
-
-  // Read 5 Huffman tables (green+length, red, blue, alpha, dist)
-  for i := 0 to 4 do
-  begin
-    // Simple code: single value?
-    if VP8LReadBits(BR, 1) <> 0 then
-    begin
-      // Simple code table: 1 or 2 symbols
-      numCodes := Integer(VP8LReadBits(BR, 1)) + 1;
-      FillChar(codeLengths[0], kAlphabetSize[i] * SizeOf(Integer), 0);
-      if numCodes = 1 then
+      2: // VERTICAL
       begin
-        codeLengths[VP8LReadBits(BR, 8)] := 1;
-      end else
-      begin
-        codeLengths[VP8LReadBits(BR, 8)] := 1;
-        codeLengths[VP8LReadBits(BR, 8)] := 1;
-      end;
-    end else
-    begin
-      // Normal Huffman: first read code-length Huffman (19 codes)
-      FillChar(clLengths, SizeOf(clLengths), 0);
-      numCodes := Integer(VP8LReadBits(BR, 4)) + 4;
-      for sym := 0 to numCodes-1 do
-        clLengths[kCodeLengthCodeOrder[sym]] := Integer(VP8LReadBits(BR, 3));
-      VP8LBuildHuffmanTable(clLengths, 19, @clTable[0], HUFF_LUT_BITS);
-      // Read symbol lengths using code-length Huffman
-      FillChar(codeLengths[0], kAlphabetSize[i] * SizeOf(Integer), 0);
-      ReadHuffCodeLengths(BR, @clTable[0], kAlphabetSize[i], codeLengths);
-    end;
-    VP8LBuildHuffmanTable(codeLengths, kAlphabetSize[i], @hg.Tables[i][0], HUFF_LUT_BITS);
-  end;
-
-  // Allocate output: RGBA
-  numPixels := w * h;
-  outBuf    := AllocMem(numPixels * 4);
-  PixBuf    := outBuf;
-
-  // Decode pixels
-  pixelIdx := 0;
-  x := 0; y := 0;
-  while pixelIdx < numPixels do
-  begin
-    // Read green channel (also encodes literal/copy/palette commands)
-    sym := HuffReadSymbol(BR, @hg.Tables[0][0], HUFF_LUT_BITS);
-    if sym < 0 then Break;
-
-    if sym < 256 then
-    begin
-      // Literal pixel: green=sym
-      green := sym;
-      red   := Byte(HuffReadSymbol(BR, @hg.Tables[1][0], HUFF_LUT_BITS));
-      blue  := Byte(HuffReadSymbol(BR, @hg.Tables[2][0], HUFF_LUT_BITS));
-      alpha := Byte(HuffReadSymbol(BR, @hg.Tables[3][0], HUFF_LUT_BITS));
-      if hasSubGreen then
-      begin
-        red  := Byte(Integer(red)  + Integer(green));
-        blue := Byte(Integer(blue) + Integer(green));
-      end;
-      outBuf[pixelIdx*4+0] := red;
-      outBuf[pixelIdx*4+1] := green;
-      outBuf[pixelIdx*4+2] := blue;
-      outBuf[pixelIdx*4+3] := alpha;
-      Inc(pixelIdx);
-      Inc(x); if x >= w then begin x := 0; Inc(y); end;
-    end else if sym < 256 + 24 then
-    begin
-      // Back-reference: copy from earlier decoded data
-      // length code = sym - 256
-      sym := sym - 256;
-      // Length extras
-      if sym < 4 then
-        length := sym + 1
-      else
-      begin
-        length := (1 shl ((sym-2) shr 1)) + 1;
-        length := length + Integer(VP8LReadBits(BR, (sym-2) shr 1));
-      end;
-      // Distance code
-      dist := Integer(HuffReadSymbol(BR, @hg.Tables[4][0], HUFF_LUT_BITS));
-      if dist < 4 then
-        dist := dist + 1
-      else
-      begin
-        dist := (1 shl ((dist-2) shr 1)) + 1;
-        dist := dist + Integer(VP8LReadBits(BR, (dist-2) shr 1));
-      end;
-      // Convert distance to (dx, dy)
-      if dist <= 120 then
-      begin
-        backX := (kCodeToPlane[dist-1] shr 4) and $F;
-        backY := kCodeToPlane[dist-1] and $F;
-        if (kCodeToPlane[dist-1] and $80) <> 0 then backX := -backX;
-      end else
-      begin
-        backX := -(dist - 1) mod w;
-        backY := (dist - 1) div w + 1;
-      end;
-      // Copy pixels
-      for i := 0 to length-1 do
-      begin
-        if pixelIdx >= numPixels then Break;
-        backX := x - backX; backY := y - backY;
-        if backX < 0 then begin Dec(backY); Inc(backX, w); end;
-        if backX >= w then begin Inc(backY); Dec(backX, w); end;
-        if (backX >= 0) and (backY >= 0) and (backX < w) and (backY < h) then
+        if prev = nil then
         begin
-          pSrc := outBuf + (backY * w + backX) * 4;
-          pDst := outBuf + pixelIdx * 4;
-          pDst[0] := pSrc[0]; pDst[1] := pSrc[1];
-          pDst[2] := pSrc[2]; pDst[3] := pSrc[3];
-        end;
-        Inc(pixelIdx);
-        Inc(x); if x >= w then begin x := 0; Inc(y); end;
+          for i := 1 to W - 1 do cur[i] := Byte(cur[i-1] + cur[i]);
+        end else
+          for i := 0 to W - 1 do cur[i] := Byte(prev[i] + cur[i]);
       end;
-    end else
-    begin
-      // Color cache (sym >= 280): not supported
-      Inc(pixelIdx);
-      Inc(x); if x >= w then begin x := 0; Inc(y); end;
+      3: // GRADIENT
+      begin
+        if prev = nil then
+        begin
+          for i := 1 to W - 1 do cur[i] := Byte(cur[i-1] + cur[i]);
+        end else
+        begin
+          cur[0] := Byte(prev[0] + cur[0]);  // left=top=topleft=prev[0]
+          for i := 1 to W - 1 do
+          begin
+            g := Integer(cur[i-1]) + Integer(prev[i]) - Integer(prev[i-1]);
+            if g < 0 then pred := 0 else if g > 255 then pred := 255 else pred := g;
+            cur[i] := Byte(cur[i] + pred);
+          end;
+        end;
+      end;
     end;
+    prev := cur;
   end;
+end;
+
+// Decode the ALPH chunk into AlphaOut (W*H bytes). Returns False on error.
+function DecodeAlpha(AlphData: PByte; AlphSize: NativeUInt; W, H: Integer;
+  AlphaOut: PByte): Boolean;
+var
+  method, filter, i, n: Integer;
+  bitData: PByte;
+  bitSize: NativeUInt;
+  pixels: PCardinal;
+  BR: TVP8LBitReader;
+begin
+  Result := False;
+  if AlphSize < 1 then Exit;
+  method := AlphData[0] and 3;
+  filter := (AlphData[0] shr 2) and 3;
+  bitData := AlphData + 1;
+  bitSize := AlphSize - 1;
+  n := W * H;
+  if method = 0 then
+  begin
+    // Uncompressed: raw alpha bytes
+    if bitSize < NativeUInt(n) then Exit;
+    Move(bitData^, AlphaOut^, n);
+  end else if method = 1 then
+  begin
+    // VP8L lossless: headerless stream, alpha = green channel
+    VP8LInitBitReader(BR, bitData, bitSize);
+    if not VP8LDecodeBody(BR, W, H, pixels) then Exit;
+    for i := 0 to n - 1 do AlphaOut[i] := Byte((pixels[i] shr 8) and $FF);
+    FreeMem(pixels);
+  end else
+    Exit;
+
+  VP8UnfilterAlpha(filter, AlphaOut, W, H);
   Result := True;
 end;
 
@@ -2491,7 +3712,8 @@ end;
 function ParseRIFF(Data: PByte; Size: NativeUInt;
   out ChunkData: PByte; out ChunkSize: NativeUInt;
   out IsLossless: Boolean;
-  out HasAlpha: Boolean): Integer;
+  out HasAlpha: Boolean;
+  out AlphaData: PByte; out AlphaSize: NativeUInt): Integer;
 var
   riffTag, webpTag, fmtTag: Cardinal;
   riffSize: Cardinal;
@@ -2506,6 +3728,8 @@ begin
   HasAlpha   := False;
   ChunkData  := nil;
   ChunkSize  := 0;
+  AlphaData  := nil;
+  AlphaSize  := 0;
   if Size < 12 then Exit;
 
   riffTag := ReadLE32(Data);
@@ -2527,6 +3751,12 @@ begin
     begin
       vp8x_flags := ReadLE32(chunk.Data);
       HasAlpha    := (vp8x_flags and 16) <> 0;
+    end;
+    // Locate the alpha chunk (for lossy + alpha)
+    if FindChunk(inner, innerSize, 'ALPH', alphaChunk) then
+    begin
+      AlphaData := alphaChunk.Data;
+      AlphaSize := alphaChunk.Size;
     end;
     // Now find actual image chunk
     if FindChunk(inner, innerSize, 'VP8L', chunk) then
@@ -2600,10 +3830,25 @@ begin
   Width  := D.PicWidth;
   Height := D.PicHeight;
 
+  // Determine in-loop filter type (0=none, 1=simple, 2=complex)
+  if D.FilterLevel = 0 then D.FilterType := 0
+  else if D.FilterSimple then D.FilterType := 1
+  else D.FilterType := 2;
+
   // Allocate output buffer
   D.OutStride := D.PicWidth * D.OutBpp;
   outSize  := NativeUInt(D.PicHeight) * NativeUInt(D.OutStride);
   D.OutBuf := AllocMem(outSize);
+
+  // Allocate full-frame YUV planes (size = MB-aligned dimensions)
+  D.FYStride  := D.MbW * 16;
+  D.FUVStride := D.MbW * 8;
+  D.FYPlane := AllocMem(D.FYStride * D.MbH * 16);
+  D.FUPlane := AllocMem(D.FUVStride * D.MbH * 8);
+  D.FVPlane := AllocMem(D.FUVStride * D.MbH * 8);
+  D.FInfo   := PVP8FInfo(AllocMem(D.MbW * D.MbH * SizeOf(TVP8FInfo)));
+
+  VP8PrecomputeFilterStrengths(D);
 
   // Allocate top-row context buffers
   topBufSize := D.MbW * 32;  // 16Y + 8U + 8V per MB column
@@ -2630,7 +3875,11 @@ begin
   for i := 0 to  7 do D.YuvBuf[V_OFF + i * BPS - 1] := 129;
 
   if VP8DecodeFrame(D) then
-    Result := D.OutBuf
+  begin
+    VP8FilterFrame(D);   // in-loop deblocking filter
+    VP8EmitFrame(D);     // YUV planes -> RGB output
+    Result := D.OutBuf;
+  end
   else
   begin
     FreeMem(D.OutBuf);
@@ -2640,6 +3889,10 @@ begin
   FreeMem(topBuf);
   FreeMem(D.MBInfo);
   FreeMem(D.IntraT);
+  if D.FYPlane <> nil then FreeMem(D.FYPlane);
+  if D.FUPlane <> nil then FreeMem(D.FUPlane);
+  if D.FVPlane <> nil then FreeMem(D.FVPlane);
+  if D.FInfo   <> nil then FreeMem(D.FInfo);
 end;
 
 // ============================================================
@@ -2656,13 +3909,15 @@ var
   BR:  TVP8LBitReader;
   tmp: Cardinal;
   w, h: Integer;
+  alphaData: PByte;
+  alphaSize: NativeUInt;
 begin
   Result := False;
   Width  := 0;
   Height := 0;
   if DataSize < 12 then Exit;
 
-  riffType := ParseRIFF(Data, DataSize, chunkData, chunkSize, isLossless, hasAlpha);
+  riffType := ParseRIFF(Data, DataSize, chunkData, chunkSize, isLossless, hasAlpha, alphaData, alphaSize);
   if riffType = 0 then Exit;
 
   if isLossless then
@@ -2699,12 +3954,16 @@ var
   lsW, lsH: Integer;
   outBuf: PByte;
   i: Integer;
+  alphaData: PByte;
+  alphaSize: NativeUInt;
+  alphaPlane: PByte;
+  aOff: Integer;
 begin
   Result := nil;
   Width  := 0;
   Height := 0;
 
-  riffType := ParseRIFF(Data, DataSize, chunkData, chunkSize, isLossless, hasAlpha);
+  riffType := ParseRIFF(Data, DataSize, chunkData, chunkSize, isLossless, hasAlpha, alphaData, alphaSize);
   if riffType = 0 then Exit;
 
   if isLossless then
@@ -2774,6 +4033,19 @@ begin
   end else
   begin
     Result := VP8Decode(chunkData, chunkSize, Mode, Width, Height);
+    // Decode and apply the alpha plane (VP8X + ALPH chunk), if present.
+    if (Result <> nil) and hasAlpha and (alphaData <> nil) and
+       (Mode in [csmRGBA, csmBGRA, csmARGB]) then
+    begin
+      alphaPlane := AllocMem(Width * Height);
+      if DecodeAlpha(alphaData, alphaSize, Width, Height, alphaPlane) then
+      begin
+        if Mode = csmARGB then aOff := 0 else aOff := 3;  // alpha byte offset
+        for i := 0 to Width * Height - 1 do
+          Result[i*4 + aOff] := alphaPlane[i];
+      end;
+      FreeMem(alphaPlane);
+    end;
   end;
 end;
 
