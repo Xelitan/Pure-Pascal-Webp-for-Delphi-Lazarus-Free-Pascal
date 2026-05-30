@@ -41,10 +41,6 @@ type
     procedure SetTransparent(Value: Boolean); override;
     procedure SetWidth(Value: Integer);override;
 
-    procedure DecodeFromStreamWindows(Str: TStream);
-    {$IFDEF LINUX}
-    procedure DecodeFromStreamLinux(Str: TStream);
-    {$ENDIF}
   public
     procedure Assign(Source: TPersistent); override;
     procedure LoadFromStream(Stream: TStream); override;
@@ -58,21 +54,42 @@ implementation
 
 { TWebpImage }
 
-procedure TWebpImage.DecodeFromStream(Str: TStream);
-begin
 {$IFDEF MSWINDOWS}
-  DecodeFromStreamWindows(Str);
-{$ELSE}
-  {$IFDEF LINUX}
-  DecodeFromStreamLinux(Str);
-  {$ELSE}
-  raise EInvalidGraphic.Create('WebP decode: unsupported platform');
-  {$ENDIF}
-{$ENDIF}
+procedure TWebpImage.DecodeFromStream(Str: TStream);
+var
+  Data    : array of Byte;
+  DataSize: NativeUInt;
+  Pixels  : PByte;
+  W, H, y : Integer;
+begin
+  DataSize := NativeUInt(Str.Size - Str.Position);
+  if DataSize = 0 then
+    raise EInvalidGraphic.Create('WebP: empty stream');
+
+  SetLength(Data, DataSize);
+  Str.ReadBuffer(Data[0], DataSize);
+
+  // WebPDecodeBGRA writes B,G,R,A per pixel — identical to the Windows
+  // 32-bit DIB layout used by TBitmap.ScanLine when PixelFormat = pf32bit.
+  Pixels := WebPDecodeBGRA(@Data[0], DataSize, W, H);
+  if Pixels = nil then
+    raise EInvalidGraphic.Create('WebP decode failed');
+  try
+    FBmp.PixelFormat := pf32bit;
+    FBmp.SetSize(W, H);
+
+    for y := 0 to H - 1 do
+      Move((Pixels + NativeUInt(y) * NativeUInt(W) * 4)^,
+           FBmp.ScanLine[y]^,
+           W * 4);
+  finally
+    FreeMem(Pixels);
+  end;
 end;
+{$ENDIF}
 
 {$IFDEF LINUX}
-procedure TWebpImage.DecodeFromStreamLinux(Str: TStream);
+procedure TWebpImage.DecodeFromStream(Str: TStream);
 var
   Data    : array of Byte;
   DataSize: NativeUInt;
@@ -127,38 +144,6 @@ begin
   end;
 end;
 {$ENDIF}
-
-procedure TWebpImage.DecodeFromStreamWindows(Str: TStream);
-var
-  Data    : array of Byte;
-  DataSize: NativeUInt;
-  Pixels  : PByte;
-  W, H, y : Integer;
-begin
-  DataSize := NativeUInt(Str.Size - Str.Position);
-  if DataSize = 0 then
-    raise EInvalidGraphic.Create('WebP: empty stream');
-
-  SetLength(Data, DataSize);
-  Str.ReadBuffer(Data[0], DataSize);
-
-  // WebPDecodeBGRA writes B,G,R,A per pixel — identical to the Windows
-  // 32-bit DIB layout used by TBitmap.ScanLine when PixelFormat = pf32bit.
-  Pixels := WebPDecodeBGRA(@Data[0], DataSize, W, H);
-  if Pixels = nil then
-    raise EInvalidGraphic.Create('WebP decode failed');
-  try
-    FBmp.PixelFormat := pf32bit;
-    FBmp.SetSize(W, H);
-
-    for y := 0 to H - 1 do
-      Move((Pixels + NativeUInt(y) * NativeUInt(W) * 4)^,
-           FBmp.ScanLine[y]^,
-           W * 4);
-  finally
-    FreeMem(Pixels);
-  end;
-end;
 
 procedure TWebpImage.Draw(ACanvas: TCanvas; const Rect: TRect);
 begin
