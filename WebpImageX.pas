@@ -1,4 +1,4 @@
-unit WebpImageX;
+﻿unit WebpImageX;
 
 {$IFDEF FPC}{$MODE DELPHI}{$ENDIF}
 
@@ -42,7 +42,9 @@ type
     procedure SetWidth(Value: Integer);override;
 
     procedure DecodeFromStreamWindows(Str: TStream);
+    {$IFDEF LINUX}
     procedure DecodeFromStreamLinux(Str: TStream);
+    {$ENDIF}
   public
     procedure Assign(Source: TPersistent); override;
     procedure LoadFromStream(Stream: TStream); override;
@@ -69,6 +71,7 @@ begin
 {$ENDIF}
 end;
 
+{$IFDEF LINUX}
 procedure TWebpImage.DecodeFromStreamLinux(Str: TStream);
 var
   Data    : array of Byte;
@@ -123,6 +126,7 @@ begin
     FreeMem(Pixels);
   end;
 end;
+{$ENDIF}
 
 procedure TWebpImage.DecodeFromStreamWindows(Str: TStream);
 var
