@@ -1,4 +1,4 @@
-unit WebPDec;
+﻿unit WebPDec;
 
 ////////////////////////////////////////////////////////////////////////////////
 //                                                                            //
@@ -796,7 +796,7 @@ begin
   nextcode[0] := 0;
   for len := 1 to 15 do
   begin
-    code := (code + count[len-1]) shl 1;
+    code := (code + Cardinal(count[len-1])) shl 1;
     nextcode[len] := code;
   end;
   // Fill table
@@ -1002,6 +1002,7 @@ var
   i, q: Integer;
   m: ^TVP8QuantMatrix;
 begin
+  q := 0;
   base_q0 := Integer(VP8RdGetValue(BR, 7));
   if VP8RdGet(BR) <> 0 then dqy1_dc  := VP8RdGetSignedValue(BR, 4) else dqy1_dc  := 0;
   if VP8RdGet(BR) <> 0 then dqy2_dc  := VP8RdGetSignedValue(BR, 4) else dqy2_dc  := 0;
@@ -1107,26 +1108,21 @@ procedure VP8ParseIntraModes(var D: TVP8Decoder);
 // Fills D.MBData[] — called ONCE per frame before residual decoding.
 // For each MB: IsI4x4, IModes[16], UVMode, Segment
 var
-  mbx, mby, i: Integer;
-  top_modes: array[0..0] of Byte; // placeholder — real decoder needs top[] per col
   topY: PByte;  // [MbW * 16] — Y top-row modes for 4x4
-  pMB: PVP8MBData;
   seg_proba: array[0..MB_FEATURE_TREE_PROBS-1] of Byte;
-  seg: Integer;
   leftMode: array[0..15] of Byte; // left column 4x4 modes
-  leftUV: Byte;
 begin
   // For mode parsing we need a top-modes array (one 4x4 mode per top-pixel)
   // Allocate temporary: MbW * 4 bytes for top modes
   topY := AllocMem(D.MbW * 4 * SizeOf(Byte));
   FillChar(topY^, D.MbW * 4, B_DC_PRED);
   FillChar(leftMode, SizeOf(leftMode), B_DC_PRED);
-  leftUV := DC_PRED;
+  //leftUV := DC_PRED;
 
   // Default segment proba
   seg_proba[0] := 145; seg_proba[1] := 145; seg_proba[2] := 145;
 
-  pMB := PVP8MBData(D.OutBuf); // WRONG — need separate mode buffer
+  //pMB := PVP8MBData(D.OutBuf); // WRONG — need separate mode buffer
   // Actually store modes in D.MBData (only last row needed for residuals)
   // For simplicity, we parse modes and residuals together per-row in the main loop
   FreeMem(topY);
@@ -1259,7 +1255,7 @@ var
 begin
   mb      := @D.MBData;
   leftMB  := D.MBInfo;                                          // dec->mb_info - 1
-  topMB   := PVP8MB(NativeUInt(D.MBInfo) + (MbX+1)*SizeOf(TVP8MB));  // dec->mb_info + mb_x
+  topMB   := PVP8MB(NativeUInt(D.MBInfo) + NativeUInt((MbX+1)*SizeOf(TVP8MB)));  // dec->mb_info + mb_x
   dqm     := @D.DQM[mb^.Segment];
 
   FillChar(mb^.Coeffs[0], SizeOf(mb^.Coeffs), 0);
@@ -1510,7 +1506,6 @@ procedure VP8PredLuma16(Mode: Integer; Dst: PByte; TopCtx, LeftCtx: PByte;
 var topLeft: Byte;
     tmpLeft: array[0..15] of Byte;
     tmpTop:  array[0..15] of Byte;
-    i: Integer;
 begin
   if not HasTop  then FillChar(tmpTop,  16, 127) else Move(TopCtx^, tmpTop, 16);
   if not HasLeft then FillChar(tmpLeft, 16, 129) else Move(LeftCtx^, tmpLeft, 16);
@@ -1726,10 +1721,10 @@ end;
 procedure I4x4_HD(Dst: PByte; Top, Left: PByte; TL: Byte; Stride: Integer);
 // Matches HD4_C: DST(x,y) = (Dst + y*Stride + x)^
 // X=TL, I=Left[0], J=Left[1], K=Left[2], L=Left[3]; A..C=Top[0..2], D=Top[3]
-var X, I, J, K, L, A, B, C, D: Integer;
+var X, I, J, K, L, A, B, C: Integer;
 begin
   X := TL;        I := (Left+0)^; J := (Left+1)^; K := (Left+2)^; L := (Left+3)^;
-  A := (Top+0)^;  B := (Top+1)^;  C := (Top+2)^;  D := (Top+3)^;
+  A := (Top+0)^;  B := (Top+1)^;  C := (Top+2)^;  //D := (Top+3)^;
   // DST(0,0)=DST(2,1)=Avg2(I,X)
   (Dst+0*Stride+0)^ := Avg2(I,X);  (Dst+1*Stride+2)^ := Avg2(I,X);
   // DST(0,1)=DST(2,2)=Avg2(J,I)
@@ -1751,7 +1746,7 @@ begin
   // DST(1,3)=Avg3(L,K,J)
   (Dst+3*Stride+1)^ := Avg3(L,K,J);
   // Note: D (Top[3]) is not used in HD4
-  D := D; // suppress hint
+  //D := D; // suppress hint
 end;
 
 procedure I4x4_HU(Dst: PByte; Left: PByte; Stride: Integer);
@@ -1857,7 +1852,8 @@ begin
     // I4x4: predict each 4x4 sub-block independently, then apply residuals
     for n := 0 to 15 do
     begin
-      x := n and 3; y := n shr 2;
+      //x := n and 3;
+      //y := n shr 2;
       yDst := yBase + kScan[n];
       // Collect left column (4 pixels, strided BPS apart) into contiguous temp
       leftCol[0] := (yDst - 1 + 0*BPS)^;
@@ -2389,7 +2385,7 @@ begin
       PCardinal(yBase + 11 * BPS + 16)^ := PCardinal(yBase - BPS + 16)^;
 
       mb  := @D.MBData;
-      info := PVP8MB(NativeUInt(D.MBInfo) + (mbx+1)*SizeOf(TVP8MB));
+      info := PVP8MB(NativeUInt(D.MBInfo) + NativeUInt((mbx+1)*SizeOf(TVP8MB)));
       topCtx := D.IntraT + mbx * 4;
 
       // --- Parse intra modes from partition 0 ---
@@ -2677,7 +2673,7 @@ begin
   NumNodes  := 1;
   NumOpen   := 1;
   TableSize := 1 shl RootBits;  // initial root size (used for first SecBase advance)
-  TableBits := RootBits;
+  //TableBits := RootBits;
   SecBase   := 0;
   Sym2      := 0;
 
@@ -3714,7 +3710,7 @@ function ParseRIFF(Data: PByte; Size: NativeUInt;
   out HasAlpha: Boolean;
   out AlphaData: PByte; out AlphaSize: NativeUInt): Integer;
 var
-  riffTag, webpTag, fmtTag: Cardinal;
+  riffTag, webpTag: Cardinal;
   riffSize: Cardinal;
   inner: PByte;
   innerSize: NativeUInt;
@@ -3907,7 +3903,6 @@ var
   riffType: Integer;
   BR:  TVP8LBitReader;
   tmp: Cardinal;
-  w, h: Integer;
   alphaData: PByte;
   alphaSize: NativeUInt;
 begin

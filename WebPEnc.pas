@@ -1,4 +1,4 @@
-unit WebPEnc;
+﻿unit WebPEnc;
 
 ////////////////////////////////////////////////////////////////////////////////
 //                                                                            //
@@ -1388,7 +1388,7 @@ var
   used:   array of Boolean;
   leaf:   array of Integer;
   cnt:    array of Integer;
-  m, i, total, a, b, node, d, mx, act, k: Integer;
+  m, i, total, a, b, node, d, mx, act: Integer;
   bestA, bestB: Integer;
 begin
   for i := 0 to n-1 do lengths[i] := 0;
