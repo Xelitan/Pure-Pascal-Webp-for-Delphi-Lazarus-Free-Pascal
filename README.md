@@ -1,6 +1,6 @@
 # Webp for Delphi and Lazarus
 
-Only decoding for now
+Can encode and decode without any DLLs or other binaries.
 
 ## Usage
 
