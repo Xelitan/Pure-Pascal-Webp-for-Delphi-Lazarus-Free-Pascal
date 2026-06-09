@@ -25,3 +25,9 @@ begin
   web.free;
 end;
 ```
+
+## Compatibility
+
+WebP decoding was tested and works:
+- on Windows in Delphi/Lazarus 
+- on Linux Mint in Lazarus.
