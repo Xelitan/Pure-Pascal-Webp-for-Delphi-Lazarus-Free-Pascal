@@ -26,6 +26,30 @@ begin
 end;
 ```
 
+## Playing animations
+
+```
+   uses WebPAnimate, ...;
+
+  Player := TWebPAnimate.Create(Self);
+  Player.Parent  := Self;
+  Player.Align   := alClient;
+  Player.Stretch := True;
+  Player.AutoPlay := True;
+  Player.LoadFromFile('anim.webp');
+```
+## Extracting frames from animations
+
+```
+   uses WebPAnimated;
+
+   Anim := TWebPAnimation.Create;
+   Anim.LoadFromFile('anim.webp');
+   for i := 0 to Anim.FrameCount - 1 do
+     Anim.Frames[i].SaveToFile('frame.bmp');
+   Anim.Free;
+```
+
 ## Compatibility
 
 WebP decoding was tested and works:
