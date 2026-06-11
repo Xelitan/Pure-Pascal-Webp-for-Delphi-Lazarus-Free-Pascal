@@ -3,8 +3,8 @@
 ////////////////////////////////////////////////////////////////////////////////
 //                                                                            //
 // Description:	WEBP port                                                     //
-// Version:	0.5                                                           //
-// Date:	30-MAY-2026                                                   //
+// Version:	0.6                                                           //
+// Date:	11-JUN-2026                                                   //
 // License:     MIT                                                           //
 // Target:	Win64, Free Pascal, Delphi                                    //
 // Copyright:	(c) 2026 Xelitan.com.                                         //
@@ -65,6 +65,16 @@ type
     run    : Integer;
     nb_bits: Integer;
   end;
+
+  TByteArray = array[0..MaxInt div SizeOf(Byte) - 1] of Byte;
+  PByteArray = ^TByteArray;
+
+  TCardinalArray = array[0..MaxInt div SizeOf(Cardinal) - 1] of Cardinal;
+  PCardinalArray = ^TCardinalArray;
+
+  TIntegerArray = array[0..MaxInt div SizeOf(Integer) - 1] of Integer;
+  PIntegerArray = ^TIntegerArray;
+
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1393,7 +1403,7 @@ var
 begin
   for i := 0 to n-1 do lengths[i] := 0;
   SetLength(cnt, n);
-  for i := 0 to n-1 do cnt[i] := counts[i];
+  for i := 0 to n-1 do cnt[i] := PIntegerArray(counts)^[i]; //do cnt[i] := counts[i];
   SetLength(wt, 2*n);
   SetLength(par, 2*n);
   SetLength(used, 2*n);
@@ -1466,24 +1476,40 @@ var
   nextCode: array[0..15] of Cardinal;
   i, len: Integer;
   code: Cardinal;
+  L: PByteArray;
+  C: PCardinalArray;
 begin
+  L := PByteArray(lengths);
+  C := PCardinalArray(codes);
+
   FillChar(blCount, SizeOf(blCount), 0);
-  for i := 0 to n-1 do Inc(blCount[lengths[i]]);
+
+  for i := 0 to n - 1 do
+    Inc(blCount[L^[i]]);
+
   blCount[0] := 0;
   code := 0;
+
   FillChar(nextCode, SizeOf(nextCode), 0);
+
   for len := 1 to 15 do
   begin
-    code := (code + Cardinal(blCount[len-1])) shl 1;
+    code := (code + Cardinal(blCount[len - 1])) shl 1;
     nextCode[len] := code;
   end;
-  for i := 0 to n-1 do
-    if lengths[i] <> 0 then
+
+  for i := 0 to n - 1 do
+  begin
+    len := L^[i];
+
+    if len <> 0 then
     begin
-      codes[i] := RevBits(nextCode[lengths[i]], lengths[i]);
-      Inc(nextCode[lengths[i]]);
-    end else
-      codes[i] := 0;
+      C^[i] := RevBits(nextCode[len], len);
+      Inc(nextCode[len]);
+    end
+    else
+      C^[i] := 0;
+  end;
 end;
 
 // Emit a Huffman table to the bitstream and fill writeLen/writeCode for symbols.
@@ -1495,25 +1521,42 @@ var
   clCounts: array[0..18] of Integer;
   clLen: array[0..18] of Byte;
   clCode: array[0..18] of Cardinal;
+  WL: PByteArray;
+  WC: PCardinalArray;
 begin
+  WL := PByteArray(writeLen);
+  WC := PCardinalArray(writeCode);
+
   SetLength(lengths, n);
   HuffLengths(counts, n, 15, @lengths[0]);
-  // count distinct symbols (length>0)
-  m := 0; s1 := -1; s2 := -1;
 
-  for i := 0 to n-1 do if lengths[i] > 0 then
-  begin Inc(m);
-    if s1<0 then s1:=i
-     else if s2<0 then s2:=i;
-  end;
+  // count distinct symbols length > 0
+  m := 0;
+  s1 := -1;
+  s2 := -1;
 
-  if m <= 2 then begin
-    LBWPut(bw, 1, 1);                       // is_simple = 1
+  for i := 0 to n - 1 do
+    if lengths[i] > 0 then
+    begin
+      Inc(m);
+      if s1 < 0 then
+        s1 := i
+      else if s2 < 0 then
+        s2 := i;
+    end;
+
+  if m <= 2 then
+  begin
+    LBWPut(bw, 1, 1);              // is_simple = 1
+
     if m = 0 then
     begin
-      s1 := 0; m := 1;
-    end; // degenerate: emit symbol 0
-    LBWPut(bw, Cardinal(m-1), 1);           // num_symbols-1
+      s1 := 0;
+      m := 1;
+    end;
+
+    LBWPut(bw, Cardinal(m - 1), 1); // num_symbols - 1
+
     if s1 < 2 then
     begin
       LBWPut(bw, 0, 1);
@@ -1524,20 +1567,26 @@ begin
       LBWPut(bw, 1, 1);
       LBWPut(bw, Cardinal(s1), 8);
     end;
-    for i := 0 to n-1 do
-      begin
-      writeLen[i] := 0;
-      writeCode[i] := 0;
-      end;
-    if m = 2 then begin
-      LBWPut(bw, Cardinal(s2), 8);
-      // canonical length-1 codes: smaller symbol -> 0, larger -> 1
-      writeLen[s1] := 1;
-      writeCode[s1] := 0;
-      writeLen[s2] := 1;
-      writeCode[s2] := 1;
+
+    for i := 0 to n - 1 do
+    begin
+      WL^[i] := 0;
+      WC^[i] := 0;
     end;
-    // m=1 -> writeLen stays 0 (decoder consumes 0 bits)
+
+    if m = 2 then
+    begin
+      LBWPut(bw, Cardinal(s2), 8);
+
+      // canonical length-1 codes: smaller symbol -> 0, larger -> 1
+      WL^[s1] := 1;
+      WC^[s1] := 0;
+
+      WL^[s2] := 1;
+      WC^[s2] := 1;
+    end;
+
+    // m = 1 -> writeLen stays 0, decoder consumes 0 bits
     Exit;
   end;
 
@@ -1570,56 +1619,80 @@ var
   histG: array[0..279] of Integer;
   histR, histB, histA: array[0..255] of Integer;
   histD: array[0..39] of Integer;
-  lenG: array[0..279] of Byte; codeG: array[0..279] of Cardinal;
+  lenG: array[0..279] of Byte;
+  codeG: array[0..279] of Cardinal;
   lenR, lenB, lenA: array[0..255] of Byte;
   codeR, codeB, codeA: array[0..255] of Cardinal;
-  lenD: array[0..39] of Byte; codeD: array[0..39] of Cardinal;
-  px: Cardinal; g, r, b, a: Integer;
+  lenD: array[0..39] of Byte;
+  codeD: array[0..39] of Cardinal;
+  px: Cardinal;
+  g, r, b, a: Integer;
   alphaUsed: Integer;
-  out8, wptr: PByte; riffsize, chunksize, padByte: Integer;
+  out8, wptr: PByte;
+  riffsize, chunksize, padByte: Integer;
+  ARGBArr: PCardinalArray;
+  WPtrArr: PByteArray;
 begin
   Result := False;
   OutData := nil;
   OutSize := 0;
-  if (w <= 0) or (h <= 0) or (w > 16384) or (h > 16384) then Exit;
-  npix := w*h;
+
+  if (w <= 0) or (h <= 0) or (w > 16384) or (h > 16384) or (argb = nil) then
+    Exit;
+
+  npix := w * h;
+  ARGBArr := PCardinalArray(argb);
 
   FillChar(histG, SizeOf(histG), 0);
   FillChar(histR, SizeOf(histR), 0);
   FillChar(histB, SizeOf(histB), 0);
   FillChar(histA, SizeOf(histA), 0);
   FillChar(histD, SizeOf(histD), 0);
+
   alphaUsed := 0;
-  for i := 0 to npix-1 do begin
-    px := argb[i];
-    Inc(histG[(px shr 8)  and $FF]);
+
+  for i := 0 to npix - 1 do
+  begin
+    px := ARGBArr^[i];
+
+    Inc(histG[(px shr 8) and $FF]);
     Inc(histR[(px shr 16) and $FF]);
-    Inc(histB[ px         and $FF]);
+    Inc(histB[px and $FF]);
     Inc(histA[(px shr 24) and $FF]);
-    if (px shr 24) <> $FF then alphaUsed := 1;
+
+    if (px shr 24) <> $FF then
+      alphaUsed := 1;
   end;
-  histD[0] := 1;   // single dummy distance symbol (never emitted)
+
+  histD[0] := 1; // single dummy distance symbol, never emitted
 
   LBWInit(bw);
-  if bw.buf = nil then Exit;
-  LBWPut(bw, Cardinal(w-1), 14);
-  LBWPut(bw, Cardinal(h-1), 14);
+  if bw.buf = nil then
+    Exit;
+
+  LBWPut(bw, Cardinal(w - 1), 14);
+  LBWPut(bw, Cardinal(h - 1), 14);
   LBWPut(bw, Cardinal(alphaUsed), 1);
-  LBWPut(bw, 0, 3);     // version
-  LBWPut(bw, 0, 1);     // no transform
-  LBWPut(bw, 0, 1);     // no color cache
-  LBWPut(bw, 0, 1);     // no meta-Huffman (single group)
+  LBWPut(bw, 0, 3); // version
+  LBWPut(bw, 0, 1); // no transform
+  LBWPut(bw, 0, 1); // no color cache
+  LBWPut(bw, 0, 1); // no meta-Huffman, single group
 
   WriteHuffTable(bw, @histG[0], 280, @lenG[0], @codeG[0]);
   WriteHuffTable(bw, @histR[0], 256, @lenR[0], @codeR[0]);
   WriteHuffTable(bw, @histB[0], 256, @lenB[0], @codeB[0]);
   WriteHuffTable(bw, @histA[0], 256, @lenA[0], @codeA[0]);
-  WriteHuffTable(bw, @histD[0],  40, @lenD[0], @codeD[0]);
+  WriteHuffTable(bw, @histD[0], 40, @lenD[0], @codeD[0]);
 
-  for i := 0 to npix-1 do begin
-    px := argb[i];
-    g := (px shr 8)  and $FF; r := (px shr 16) and $FF;
-    b :=  px         and $FF; a := (px shr 24) and $FF;
+  for i := 0 to npix - 1 do
+  begin
+    px := ARGBArr^[i];
+
+    g := (px shr 8) and $FF;
+    r := (px shr 16) and $FF;
+    b := px and $FF;
+    a := (px shr 24) and $FF;
+
     LBWPut(bw, codeG[g], lenG[g]);
     LBWPut(bw, codeR[r], lenR[r]);
     LBWPut(bw, codeB[b], lenB[b]);
@@ -1628,11 +1701,11 @@ begin
 
   bsSize := LBWFinish(bw);
 
-  // Assemble RIFF / VP8L (chunk data = 0x2F signature byte + bitstream)
   chunksize := 1 + bsSize;
-  padByte   := chunksize and 1;
-  riffsize  := 4 + (8 + chunksize + padByte);
-  fileSize  := 8 + riffsize;
+  padByte := chunksize and 1;
+  riffsize := 4 + 8 + chunksize + padByte;
+  fileSize := 8 + riffsize;
+
   GetMem(out8, fileSize);
   if out8 = nil then
   begin
@@ -1641,38 +1714,48 @@ begin
   end;
 
   wptr := out8;
-  wptr[0]:=Ord('R');
-  wptr[1]:=Ord('I');
-  wptr[2]:=Ord('F');
-  wptr[3]:=Ord('F');
-  Inc(wptr,4);
 
-  wptr[0]:=riffsize and $ff;
-  wptr[1]:=(riffsize shr 8)and$ff;
-  wptr[2]:=(riffsize shr 16)and$ff;
-  wptr[3]:=(riffsize shr 24)and$ff;
-  Inc(wptr,4);
+  WPtrArr := PByteArray(wptr);
+  WPtrArr^[0] := Ord('R');
+  WPtrArr^[1] := Ord('I');
+  WPtrArr^[2] := Ord('F');
+  WPtrArr^[3] := Ord('F');
+  Inc(wptr, 4);
 
-  wptr[0]:=Ord('W');
-  wptr[1]:=Ord('E');
-  wptr[2]:=Ord('B');
-  wptr[3]:=Ord('P');
-  Inc(wptr,4);
+  WPtrArr := PByteArray(wptr);
+  WPtrArr^[0] := riffsize and $FF;
+  WPtrArr^[1] := (riffsize shr 8) and $FF;
+  WPtrArr^[2] := (riffsize shr 16) and $FF;
+  WPtrArr^[3] := (riffsize shr 24) and $FF;
+  Inc(wptr, 4);
 
-  wptr[0]:=Ord('V');
-  wptr[1]:=Ord('P');
-  wptr[2]:=Ord('8');
-  wptr[3]:=Ord('L');
-  Inc(wptr,4);
+  WPtrArr := PByteArray(wptr);
+  WPtrArr^[0] := Ord('W');
+  WPtrArr^[1] := Ord('E');
+  WPtrArr^[2] := Ord('B');
+  WPtrArr^[3] := Ord('P');
+  Inc(wptr, 4);
 
-  wptr[0]:=chunksize and $ff;
-  wptr[1]:=(chunksize shr 8)and$ff;
-  wptr[2]:=(chunksize shr 16)and$ff;
-  wptr[3]:=(chunksize shr 24)and$ff;
-  Inc(wptr,4);
-  wptr[0]:=$2F; Inc(wptr);   // VP8L signature
+  WPtrArr := PByteArray(wptr);
+  WPtrArr^[0] := Ord('V');
+  WPtrArr^[1] := Ord('P');
+  WPtrArr^[2] := Ord('8');
+  WPtrArr^[3] := Ord('L');
+  Inc(wptr, 4);
+
+  WPtrArr := PByteArray(wptr);
+  WPtrArr^[0] := chunksize and $FF;
+  WPtrArr^[1] := (chunksize shr 8) and $FF;
+  WPtrArr^[2] := (chunksize shr 16) and $FF;
+  WPtrArr^[3] := (chunksize shr 24) and $FF;
+  Inc(wptr, 4);
+
+  wptr^ := $2F; // VP8L signature
+  Inc(wptr);
+
   Move(bw.buf^, wptr^, bsSize);
   Inc(wptr, bsSize);
+
   if padByte <> 0 then
   begin
     wptr^ := 0;
@@ -1680,6 +1763,7 @@ begin
   end;
 
   LBWFree(bw);
+
   OutData := out8;
   OutSize := fileSize;
   Result := True;
@@ -1690,34 +1774,77 @@ function EncodeLossless(Pixels: PByte; Width, Height, Stride: Integer;
 var
   bpp, x, y: Integer;
   argb: PCardinal;
+  argbArr: PCardinalArray;
   psrc: PByte;
   rr, gg, bb, aa: Cardinal;
 begin
   Result := False;
   OutData := nil;
   OutSize := 0;
-  if (Width <= 0) or (Height <= 0) or (Pixels = nil) then Exit;
 
-  case PixOrder of 
-    poRGBA, poBGRA: bpp := 4; 
-    else bpp := 3; 
+  if (Width <= 0) or (Height <= 0) or (Pixels = nil) then
+    Exit;
+
+  case PixOrder of
+    poRGBA, poBGRA: bpp := 4;
+  else
+    bpp := 3;
   end;
-  GetMem(argb, Width * Height * 4); 
-  if argb = nil then Exit;
 
-  for y := 0 to Height-1 do
-    for x := 0 to Width-1 do begin
-      psrc := Pixels + y*Stride + x*bpp;
-      case PixOrder of
-        poBGR:  begin bb:=psrc[0]; gg:=psrc[1]; rr:=psrc[2]; aa:=255; end;
-        poBGRA: begin bb:=psrc[0]; gg:=psrc[1]; rr:=psrc[2]; aa:=psrc[3]; end;
-        poRGBA: begin rr:=psrc[0]; gg:=psrc[1]; bb:=psrc[2]; aa:=psrc[3]; end;
-        else    begin rr:=psrc[0]; gg:=psrc[1]; bb:=psrc[2]; aa:=255; end;
+  GetMem(argb, Width * Height * SizeOf(Cardinal));
+  if argb = nil then
+    Exit;
+
+  argbArr := PCardinalArray(argb);
+
+  try
+    for y := 0 to Height - 1 do
+      for x := 0 to Width - 1 do
+      begin
+        psrc := Pixels + y * Stride + x * bpp;
+
+        case PixOrder of
+          poBGR:
+            begin
+              bb := psrc^;
+              gg := (psrc + 1)^;
+              rr := (psrc + 2)^;
+              aa := 255;
+            end;
+
+          poBGRA:
+            begin
+              bb := psrc^;
+              gg := (psrc + 1)^;
+              rr := (psrc + 2)^;
+              aa := (psrc + 3)^;
+            end;
+
+          poRGBA:
+            begin
+              rr := psrc^;
+              gg := (psrc + 1)^;
+              bb := (psrc + 2)^;
+              aa := (psrc + 3)^;
+            end;
+
+        else
+          begin
+            rr := psrc^;
+            gg := (psrc + 1)^;
+            bb := (psrc + 2)^;
+            aa := 255;
+          end;
+        end;
+
+        argbArr^[y * Width + x] :=
+          (aa shl 24) or (rr shl 16) or (gg shl 8) or bb;
       end;
-      argb[y*Width + x] := (aa shl 24) or (rr shl 16) or (gg shl 8) or bb;
-    end;
-  Result := VP8LEncode(argb, Width, Height, OutData, OutSize);
-  FreeMem(argb);
+
+    Result := VP8LEncode(argb, Width, Height, OutData, OutSize);
+  finally
+    FreeMem(argb);
+  end;
 end;
 
 // ===========================================================================
